@@ -29,7 +29,7 @@ pip install .
 python install.py
 
 # 3. Run the printed command, e.g.:
-#   claude mcp add fdtd -- python -m fdtd_mcp.server --lumerical-home "D:/Software/Lumerical/v202"
+#   claude mcp add fdtd -- python -m fdtd_mcp.server --lumerical-home "<lumerical-install-path>"
 
 # 4. Restart your MCP client
 ```
@@ -43,7 +43,7 @@ If auto-detection fails, specify the Lumerical installation path:
 export LUMERICAL_HOME=/opt/lumerical/v202
 
 # Or via CLI argument in the registration command
-claude mcp add fdtd -- python -m fdtd_mcp.server --lumerical-home "D:/Software/Lumerical/v202"
+claude mcp add fdtd -- python -m fdtd_mcp.server --lumerical-home "<lumerical-install-path>"
 ```
 
 ### Other MCP clients
@@ -55,13 +55,13 @@ Add to your client's MCP server configuration:
   "mcpServers": {
     "fdtd": {
       "command": "python",
-      "args": ["-m", "fdtd_mcp.server", "--lumerical-home", "/opt/lumerical/v202"]
+      "args": ["-m", "fdtd_mcp.server", "--lumerical-home", "/opt/lumerical/v241"]
     }
   }
 }
 ```
 
-Adjust `--lumerical-home` to match your installation.
+Adjust `--lumerical-home` to match your installation. Linux default is `/opt/lumerical/v241`; Windows default is `C:/Program Files/Lumerical/v241`.
 
 ## Tools (21)
 

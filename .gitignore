@@ -22,3 +22,7 @@ Thumbs.db
 # Build
 dist/
 *.egg-info/
+
+# Claude Code
+.claude/
+CLAUDE.md

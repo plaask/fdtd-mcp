@@ -1,6 +1,6 @@
 # FDTD MCP
 
-[Lumerical FDTD](https://www.ansys.com/products/optics/fdtd) 自动化 MCP Server。通过 Model Context Protocol 让 AI 助手读取、编辑、运行和分以 FDTD 仿真工程。
+[Lumerical FDTD](https://www.ansys.com/products/optics/fdtd) 自动化 MCP Server。通过 Model Context Protocol 让 AI 助手读取、编辑、运行和分析 FDTD 仿真工程。
 
 > [English](README.md)
 
@@ -29,7 +29,7 @@ pip install .
 python install.py
 
 # 3. 执行打印出的命令，例如：
-#   claude mcp add fdtd -- python -m fdtd_mcp.server --lumerical-home "D:/Software/Lumerical/v202"
+#   claude mcp add fdtd -- python -m fdtd_mcp.server --lumerical-home "<lumerical-install-path>"
 
 # 4. 重启 MCP 客户端
 ```
@@ -43,7 +43,7 @@ python install.py
 export LUMERICAL_HOME=/opt/lumerical/v202
 
 # 或注册时指定
-claude mcp add fdtd -- python -m fdtd_mcp.server --lumerical-home "D:/Software/Lumerical/v202"
+claude mcp add fdtd -- python -m fdtd_mcp.server --lumerical-home "<lumerical-install-path>"
 ```
 
 ### 其他 MCP 客户端
@@ -55,13 +55,13 @@ claude mcp add fdtd -- python -m fdtd_mcp.server --lumerical-home "D:/Software/L
   "mcpServers": {
     "fdtd": {
       "command": "python",
-      "args": ["-m", "fdtd_mcp.server", "--lumerical-home", "/opt/lumerical/v202"]
+      "args": ["-m", "fdtd_mcp.server", "--lumerical-home", "/opt/lumerical/v241"]
     }
   }
 }
 ```
 
-将 `--lumerical-home` 路径替换为实际安装位置。
+将 `--lumerical-home` 路径替换为实际安装位置。Linux 通常为 `/opt/lumerical/v241`，Windows 通常为 `C:/Program Files/Lumerical/v241`。
 
 ## 工具（21 个）
 

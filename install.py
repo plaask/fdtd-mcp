@@ -27,7 +27,7 @@ def main():
             sys.exit(
                 'Error: ' + str(e) + '\n\n'
                 'Run with explicit path:\n'
-                '  python install.py --lumerical-home "D:/Software/Lumerical/v202"'
+                '  python install.py --lumerical-home "<your-lumerical-install-path>"'
             )
 
     print()

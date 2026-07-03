@@ -6,7 +6,7 @@ import glob
 
 
 def find_lumerical() -> str:
-    """Return the Lumerical installation root (e.g. D:/Software/Lumerical/v202).
+    """Return the Lumerical installation root (e.g. C:/Program Files/Lumerical/v241).
 
     Resolution order:
       1. LUMERICAL_HOME environment variable
@@ -26,7 +26,6 @@ def find_lumerical() -> str:
     if sys.platform == 'win32':
         search_roots = [
             'C:/Program Files/Lumerical',
-            'D:/Software/Lumerical',
         ]
     else:
         search_roots = [
@@ -47,7 +46,7 @@ def find_lumerical() -> str:
     raise FileNotFoundError(
         'Lumerical FDTD installation not found. '
         'Set LUMERICAL_HOME environment variable to the installation root, '
-        'e.g. D:/Software/Lumerical/v202'
+        'e.g. C:/Program Files/Lumerical/v202'
     )
 
 

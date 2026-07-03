@@ -135,12 +135,27 @@ class FdtdBridge(object):
                 )
             }
 
-        # ---- ?expr query: eval to _br_r, getv, clear ----
+        # ---- ?expr query: appCall for functions, getv for bare names ----
         if code.startswith('?'):
             expr = code[1:].strip()
-            self._fsp.eval('_br_r = ' + expr + ';')
-            result = self._fsp.getv('_br_r')
-            self._fsp.eval('clear(_br_r);')
+            # Function call: route through appCall (reliable)
+            m = re.match(r'(\w+)\((.+)\)', expr)
+            if m:
+                func_name = m.group(1)
+                raw_args = m.group(2)
+                args = []
+                for a in re.findall(r'"([^"]*)"|\'([^\']*)\'|([^,]+)', raw_args):
+                    arg = a[0] or a[1] or a[2].strip()
+                    try: arg = float(arg)
+                    except ValueError: pass
+                    args.append(arg)
+                result = appCall(self._fsp, func_name, args)
+                return {'status': 'ok', 'result': self._sanitize(result)}
+            # Bare name: getv (workspace variable), fallback to getnamed on ::model
+            try:
+                result = self._fsp.getv(expr)
+            except Exception:
+                result = appCall(self._fsp, 'getnamed', ['::model', expr])
             return {'status': 'ok', 'result': self._sanitize(result)}
 
         # ---- func(args) via appCall (return value capture) ----
@@ -194,12 +209,20 @@ class FdtdBridge(object):
         seen = set()
 
         def _traverse(scope):
-            """Recurse into scope, discover all objects via groupscope+selectall+getid."""
-            self._fsp.eval('groupscope("' + scope + '");')
-            self._fsp.eval('selectall();')
-            self._fsp.eval('_br_ids = getid();')
-            ids_str = self._fsp.getv('_br_ids')
-            self._fsp.eval('clear(_br_ids);')
+            """Recurse into scope, discover all objects via appCall (not eval).
+
+            Resets to ::model root before each traversal to avoid scope pollution
+            from previous recursive calls. Restores parent scope after recursion.
+            """
+            appCall(self._fsp, 'groupscope', ['::model'])
+            if scope != '::model':
+                parts = scope.replace('::model::', '').split('::')
+                for part in parts:
+                    if part:
+                        appCall(self._fsp, 'groupscope', [part])
+            appCall(self._fsp, 'selectall', [])
+            ids_raw = appCall(self._fsp, 'getid', [])
+            ids_str = str(ids_raw) if ids_raw else ''
             if not ids_str:
                 return
             for obj_id in ids_str.split('\n'):
@@ -219,6 +242,7 @@ class FdtdBridge(object):
                     objects.append(obj)
                     if str(t) in ('Structure Group', 'Analysis Group'):
                         _traverse(obj_id)
+                        appCall(self._fsp, 'groupscope', [scope])  # restore parent
                 except Exception:
                     pass
 

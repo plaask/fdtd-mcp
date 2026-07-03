@@ -20,48 +20,72 @@ The dual-process design isolates the MCP protocol (which needs modern Python) fr
 
 **Prerequisites:** Python ≥ 3.10, [Lumerical FDTD](https://www.ansys.com/products/optics/fdtd)
 
+### 1. Install the package
+
 ```bash
-# 1. Clone and install
 git clone https://github.com/plaask/fdtd-mcp.git && cd fdtd-mcp
 pip install .
-
-# 2. Print registration command（auto-detects Lumerical path）
-python install.py
-
-# 3. Run the printed command, e.g.:
-#   claude mcp add fdtd -- python -m fdtd_mcp.server --lumerical-home "<lumerical-install-path>"
-
-# 4. Restart your MCP client
 ```
 
-### Manual path specification
-
-If auto-detection fails, specify the Lumerical installation path:
+### 2. Register with Claude Code
 
 ```bash
-# Via environment variable
-export LUMERICAL_HOME=/opt/lumerical/v202
-
-# Or via CLI argument in the registration command
-claude mcp add fdtd -- python -m fdtd_mcp.server --lumerical-home "<lumerical-install-path>"
+python install.py
 ```
 
-### Other MCP clients
+This auto-detects your Lumerical installation and prints the registration command. Run it, restart Claude Code, done.
 
-Add to your client's MCP server configuration:
+If auto-detection succeeds, the printed command will be as simple as:
+
+```
+claude mcp add fdtd -- python -m fdtd_mcp.server
+```
+
+### If auto-detection fails
+
+If Lumerical is installed at a non-standard location, specify the path manually:
+
+**Option A — pass it in the registration command:**
+
+```bash
+claude mcp add fdtd -- python -m fdtd_mcp.server --lumerical-home "C:/Program Files/Lumerical/v241"
+```
+
+**Option B — set the env var once:**
+
+```powershell
+[Environment]::SetEnvironmentVariable("LUMERICAL_HOME", "C:/Program Files/Lumerical/v241", "User")
+# Restart the terminal, then just:
+claude mcp add fdtd -- python -m fdtd_mcp.server
+```
+
+### Other MCP clients (Cursor, VS Code, etc.)
+
+The JSON equivalent of `claude mcp add`. Auto-detection works here too:
 
 ```json
 {
   "mcpServers": {
     "fdtd": {
       "command": "python",
-      "args": ["-m", "fdtd_mcp.server", "--lumerical-home", "/opt/lumerical/v241"]
+      "args": ["-m", "fdtd_mcp.server"]
     }
   }
 }
 ```
 
-Adjust `--lumerical-home` to match your installation. Linux default is `/opt/lumerical/v241`; Windows default is `C:/Program Files/Lumerical/v241`.
+If auto-detection fails, add the `--lumerical-home` argument:
+
+```json
+{
+  "mcpServers": {
+    "fdtd": {
+      "command": "python",
+      "args": ["-m", "fdtd_mcp.server", "--lumerical-home", "C:/Program Files/Lumerical/v241"]
+    }
+  }
+}
+```
 
 ## Tools (21)
 

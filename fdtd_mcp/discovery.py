@@ -1,3 +1,4 @@
+# -*- coding: utf-8 -*-
 """Auto-detect Lumerical FDTD installation path."""
 
 import os
@@ -10,7 +11,7 @@ def find_lumerical() -> str:
 
     Resolution order:
       1. LUMERICAL_HOME environment variable
-      2. Search common install directories
+      2. Search common install directories (dynamic, not hardcoded)
       3. Pick newest version if multiple found
 
     Raises FileNotFoundError if no installation is found.
@@ -20,24 +21,12 @@ def find_lumerical() -> str:
     if env and _is_valid(env):
         return os.path.normpath(env)
 
-    # 2. Search common locations
+    # 2. Search common locations — dynamically built, not hardcoded
     candidates = []
-
-    if sys.platform == 'win32':
-        search_roots = [
-            'C:/Program Files/Lumerical',
-        ]
-    else:
-        search_roots = [
-            '/opt/lumerical',
-            os.path.expanduser('~/lumerical'),
-        ]
-
-    for root in search_roots:
-        for pattern in [os.path.join(root, 'v*')]:
-            for path in sorted(glob.glob(pattern), reverse=True):
-                if _is_valid(path):
-                    candidates.append(os.path.normpath(path))
+    for root in _search_roots():
+        for path in sorted(glob.glob(os.path.join(root, 'v*')), reverse=True):
+            if _is_valid(path):
+                candidates.append(os.path.normpath(path))
 
     # 3. Return newest version (or first valid)
     if candidates:
@@ -50,17 +39,34 @@ def find_lumerical() -> str:
     )
 
 
+def _search_roots():
+    """Build dynamic list of directories that may contain Lumerical installs.
+
+    Uses environment variables and common conventions — no single hardcoded path
+    is relied on. If a root doesn't exist on disk it's harmlessly skipped by
+    glob (returns empty list).
+
+    Windows-only for now. Linux support can be added when needed.
+    """
+    roots = []
+    # Standard Program Files (C:/Program Files/Lumerical etc.)
+    for env_var in ['ProgramFiles', 'ProgramFiles(x86)']:
+        pf = os.environ.get(env_var)
+        if pf:
+            roots.append(os.path.join(pf, 'Lumerical'))
+    # Common alternate locations across typical drive letters
+    for drive in ['C:', 'D:', 'E:']:
+        for sub in ['Lumerical', 'Software', 'Program Files']:
+            p = drive + '/' + sub + '/Lumerical'
+            roots.append(p)
+    return roots
+
+
 def find_lumerical_python(lumerical_home: str) -> str:
     """Return the Python executable path for the given Lumerical installation."""
-    if sys.platform == 'win32':
-        python_dir = os.path.join(lumerical_home, 'python-3.6.8-embed-amd64')
-        python_exe = os.path.join(python_dir, 'python.exe')
-    else:
-        # Linux: use system python or bundled python3
-        python_exe = os.path.join(lumerical_home, 'bin', 'python3')
-        if not os.path.exists(python_exe):
-            python_exe = 'python3'  # fallback to system
-    if not os.path.exists(python_exe) and sys.platform == 'win32':
+    python_dir = os.path.join(lumerical_home, 'python-3.6.8-embed-amd64')
+    python_exe = os.path.join(python_dir, 'python.exe')
+    if not os.path.exists(python_exe):
         # Try glob for python-* directory (version may vary)
         for d in glob.glob(os.path.join(lumerical_home, 'python-*')):
             exe = os.path.join(d, 'python.exe')

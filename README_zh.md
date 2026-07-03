@@ -20,48 +20,72 @@ AI 助手 --MCP stdio--> server.py (系统 Python ≥3.10)
 
 **前提：** Python ≥ 3.10，[Lumerical FDTD](https://www.ansys.com/products/optics/fdtd)
 
+### 1. 安装包
+
 ```bash
-# 1. 克隆并安装
 git clone https://github.com/plaask/fdtd-mcp.git && cd fdtd-mcp
 pip install .
-
-# 2. 打印注册命令（自动发现 Lumerical 路径）
-python install.py
-
-# 3. 执行打印出的命令，例如：
-#   claude mcp add fdtd -- python -m fdtd_mcp.server --lumerical-home "<lumerical-install-path>"
-
-# 4. 重启 MCP 客户端
 ```
 
-### 手动指定路径
-
-如果自动发现失败，手动指定 Lumerical 安装路径：
+### 2. 注册到 Claude Code
 
 ```bash
-# 通过环境变量
-export LUMERICAL_HOME=/opt/lumerical/v202
-
-# 或注册时指定
-claude mcp add fdtd -- python -m fdtd_mcp.server --lumerical-home "<lumerical-install-path>"
+python install.py
 ```
 
-### 其他 MCP 客户端
+自动发现 Lumerical 安装路径并打印注册命令，执行后重启 Claude Code 即可。
 
-在配置文件中添加：
+如果自动发现成功，打印的命令就是最简单的形式：
+
+```
+claude mcp add fdtd -- python -m fdtd_mcp.server
+```
+
+### 如果自动发现失败
+
+Lumerical 装在非标准位置时，手动指定路径：
+
+**方式 A — 注册时直接指定：**
+
+```bash
+claude mcp add fdtd -- python -m fdtd_mcp.server --lumerical-home "C:/Program Files/Lumerical/v241"
+```
+
+**方式 B — 设一次环境变量，一劳永逸：**
+
+```powershell
+[Environment]::SetEnvironmentVariable("LUMERICAL_HOME", "C:/Program Files/Lumerical/v241", "User")
+# 重启终端后直接注册
+claude mcp add fdtd -- python -m fdtd_mcp.server
+```
+
+### 其他 MCP 客户端（Cursor、VS Code 等）
+
+和 `claude mcp add` 等价的 JSON 配置。自动发现同样生效：
 
 ```json
 {
   "mcpServers": {
     "fdtd": {
       "command": "python",
-      "args": ["-m", "fdtd_mcp.server", "--lumerical-home", "/opt/lumerical/v241"]
+      "args": ["-m", "fdtd_mcp.server"]
     }
   }
 }
 ```
 
-将 `--lumerical-home` 路径替换为实际安装位置。Linux 通常为 `/opt/lumerical/v241`，Windows 通常为 `C:/Program Files/Lumerical/v241`。
+自动发现失败时加上 `--lumerical-home`：
+
+```json
+{
+  "mcpServers": {
+    "fdtd": {
+      "command": "python",
+      "args": ["-m", "fdtd_mcp.server", "--lumerical-home", "C:/Program Files/Lumerical/v241"]
+    }
+  }
+}
+```
 
 ## 工具（21 个）
 

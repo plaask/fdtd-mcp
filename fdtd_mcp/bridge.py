@@ -1,3 +1,4 @@
+# -*- coding: utf-8 -*-
 """
 FDTD Bridge — JSON-RPC via stdin/stdout.
 
@@ -209,18 +210,20 @@ class FdtdBridge(object):
         seen = set()
 
         def _traverse(scope):
-            """Recurse into scope, discover all objects via appCall (not eval).
+            """Recurse into scope, discover all objects.
 
-            Resets to ::model root before each traversal to avoid scope pollution
-            from previous recursive calls. Restores parent scope after recursion.
+            Always resets to ::model root before navigating to target scope,
+            so scope pollution from previous recursive calls is eliminated.
+            Uses appCall for getid (avoids eval-assignment + getv pattern).
             """
-            appCall(self._fsp, 'groupscope', ['::model'])
+            # Navigate to target scope from root
+            self._fsp.eval('groupscope("::model");')
             if scope != '::model':
                 parts = scope.replace('::model::', '').split('::')
                 for part in parts:
                     if part:
-                        appCall(self._fsp, 'groupscope', [part])
-            appCall(self._fsp, 'selectall', [])
+                        self._fsp.eval('groupscope("' + part + '");')
+            self._fsp.eval('selectall();')
             ids_raw = appCall(self._fsp, 'getid', [])
             ids_str = str(ids_raw) if ids_raw else ''
             if not ids_str:
@@ -241,8 +244,7 @@ class FdtdBridge(object):
                             pass
                     objects.append(obj)
                     if str(t) in ('Structure Group', 'Analysis Group'):
-                        _traverse(obj_id)
-                        appCall(self._fsp, 'groupscope', [scope])  # restore parent
+                        _traverse(scope + '::' + obj_id)
                 except Exception:
                     pass
 

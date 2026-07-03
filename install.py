@@ -1,3 +1,4 @@
+# -*- coding: utf-8 -*-
 """FDTD MCP installer — prints the claude mcp add registration command.
 
 Usage:

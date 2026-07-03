@@ -1,3 +1,4 @@
+# -*- coding: utf-8 -*-
 """
 FDTD MCP Server — 21 tools covering full FDTD workflow.
 

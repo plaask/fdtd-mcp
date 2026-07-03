@@ -99,45 +99,46 @@ If auto-detection fails, add the `--lumerical-home` argument:
 | Run | `run`, `run_sweep`, `get_sweep_result` |
 | Data | `get_result_data`, `get_result_file` |
 
-## Workflows
+## Usage examples
 
-### Review an existing project
-```
-open("project.fsp")
-get_scene_info()                     → all objects + properties
-get_script("::model")                → setup + analysis scripts
-get_parameters()                     → all params: {::model:{gap,...}, Cnorm:{...}, ...}
-get_sweep_info("dpgap")              → sweep config
-```
+### Open and inspect
 
-### Modify and save
 ```
-set_parameter("gap", 200e-9)
-set_parameter("LR", 0, object="LR_tfsf")
-set_script("::model", "analysis", new_code)
-save("project_v2.fsp")
+open("my_sim.fsp")
+get_scene_info()                 → all objects + properties
+get_script("::model")            → setup + analysis scripts
+get_parameters()                 → all model & group parameters
 ```
 
-### Run and extract results
+### Edit and save
+
+```
+set_parameter("wavelength", 1550e-9)
+set_script("::model", "analysis", "plot_spectrum();")
+save("my_sim_v2.fsp")
+```
+
+### Run and get data
+
 ```
 run()
-get_results("::model")               → ["dpsource","P_L","P_R","g_lum"]
-get_result_data("::model", "g_lum")  → {lambda:[...], ...}
-get_result_file("DFT", "E", "fields.mat")
+get_results("monitor1")          → list available datasets
+get_result_data("monitor1", "T") → wavelength/transmission
 ```
 
 ### Build from scratch
+
 ```
-new(dimension="3D", x_span=1e-6, y_span=1e-6, z_span=2e-6)
-execute("addtfsf()")
-set_parameter("wavelength start", 400e-9, object="TFSF")
-set_parameter("wavelength stop", 800e-9, object="TFSF")
-execute("addpower()")
-set_parameter("monitor type", "3D", object="power")
-save("my_sim.fsp")
+new(dimension="3D", x_span=2e-6, y_span=2e-6, z_span=2e-6, mesh_accuracy=4)
+execute("addrect()")
+set_parameter("x span", 500e-9, object="rectangle")
+set_parameter("material", "Si (Silicon) - Palik", object="rectangle")
+execute("addfdtd()")
+save("new_sim.fsp")
 ```
 
 ### Custom materials
+
 ```
 add_material(type="Sampled 3D data")                 → {name: "material_1"}
 set_material("material_1", "nk data",

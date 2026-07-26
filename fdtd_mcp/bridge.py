@@ -193,10 +193,7 @@ class FdtdBridge(object):
     # Scene info
     # ------------------------------------------------------------------
 
-    def _cmd_get_scene_info(self, p):
-        if not self._fsp: raise RuntimeError('No open project')
-
-        prop_list = ['type','x','y','z','x span','y span','z span','z min','z max',
+    _SCENE_PROPS = ['type','x','y','z','x span','y span','z span','z min','z max',
                      'material','index','enabled','wavelength start','wavelength stop',
                      'monitor type','frequency points','wavelength center','wavelength span',
                      'dx','dy','dz','theta','phi','injection axis','direction',
@@ -206,49 +203,64 @@ class FdtdBridge(object):
                      'z min bc','z max bc','pml layers','simulation time','dt',
                      'auto shutoff min','mesh accuracy']
 
+    _LIGHT_PROPS = ['type', 'enabled', 'material', 'x', 'y', 'z']
+
+    def _traverse(self, scope, prop_list, enabled_only, result_list, seen):
+        """Recurse into scope, appending discovered objects to result_list.
+
+        Shared between _cmd_get_scene_info and _cmd_get_model_overview.
+        Always resets to ::model root before navigating to target scope.
+        Uses appCall for getid (avoids eval-assignment + getv pattern).
+        """
+        # Navigate to target scope from root
+        self._fsp.eval('groupscope("::model");')
+        if scope != '::model':
+            parts = scope.replace('::model::', '').split('::')
+            for part in parts:
+                if part:
+                    self._fsp.eval('groupscope("' + part + '");')
+        self._fsp.eval('selectall();')
+        ids_raw = appCall(self._fsp, 'getid', [])
+        ids_str = str(ids_raw) if ids_raw else ''
+        if not ids_str:
+            return
+        for obj_id in ids_str.split('\n'):
+            obj_id = obj_id.strip()
+            if not obj_id or obj_id in seen:
+                continue
+            seen.add(obj_id)
+            try:
+                t = appCall(self._fsp, 'getnamed', [obj_id, 'type'])
+                obj = {'name': obj_id, 'type': str(t)}
+                for prop in prop_list:
+                    try:
+                        obj[prop] = self._sanitize(
+                            appCall(self._fsp, 'getnamed', [obj_id, prop]))
+                    except Exception:
+                        pass
+                # enabled_only filter (if enabled property was read)
+                if enabled_only:
+                    en = obj.get('enabled')
+                    if en is not None and not en:
+                        # Skip disabled objects (but still recurse groups)
+                        if str(t) in ('Structure Group', 'Analysis Group'):
+                            self._traverse(scope + '::' + obj_id, prop_list,
+                                           enabled_only, result_list, seen)
+                        continue
+                result_list.append(obj)
+                if str(t) in ('Structure Group', 'Analysis Group'):
+                    self._traverse(scope + '::' + obj_id, prop_list,
+                                   enabled_only, result_list, seen)
+            except Exception:
+                pass
+
+    def _cmd_get_scene_info(self, p):
+        if not self._fsp: raise RuntimeError('No open project')
+        enabled_only = bool(p.get('enabled_only', False))
+
         objects = []
         seen = set()
-
-        def _traverse(scope):
-            """Recurse into scope, discover all objects.
-
-            Always resets to ::model root before navigating to target scope,
-            so scope pollution from previous recursive calls is eliminated.
-            Uses appCall for getid (avoids eval-assignment + getv pattern).
-            """
-            # Navigate to target scope from root
-            self._fsp.eval('groupscope("::model");')
-            if scope != '::model':
-                parts = scope.replace('::model::', '').split('::')
-                for part in parts:
-                    if part:
-                        self._fsp.eval('groupscope("' + part + '");')
-            self._fsp.eval('selectall();')
-            ids_raw = appCall(self._fsp, 'getid', [])
-            ids_str = str(ids_raw) if ids_raw else ''
-            if not ids_str:
-                return
-            for obj_id in ids_str.split('\n'):
-                obj_id = obj_id.strip()
-                if not obj_id or obj_id in seen:
-                    continue
-                seen.add(obj_id)
-                try:
-                    t = appCall(self._fsp, 'getnamed', [obj_id, 'type'])
-                    obj = {'name': obj_id, 'type': str(t)}
-                    for prop in prop_list:
-                        try:
-                            obj[prop] = self._sanitize(
-                                appCall(self._fsp, 'getnamed', [obj_id, prop]))
-                        except Exception:
-                            pass
-                    objects.append(obj)
-                    if str(t) in ('Structure Group', 'Analysis Group'):
-                        _traverse(scope + '::' + obj_id)
-                except Exception:
-                    pass
-
-        _traverse('::model')
+        self._traverse('::model', self._SCENE_PROPS, enabled_only, objects, seen)
 
         fdtd = {}
         for k in ['dimension','x span','y span','z span','simulation time','mesh accuracy']:
@@ -256,6 +268,180 @@ class FdtdBridge(object):
             except Exception: pass
 
         return {'objects': objects, 'fdtd_summary': fdtd, 'object_count': len(objects)}
+
+    # ------------------------------------------------------------------
+    # Model variables (P0-2) + Model overview (P0-1)
+    # ------------------------------------------------------------------
+
+    # Known model variable names from user's typical .fsp files.
+    # These are probed in addition to regex-discovered names.
+    _KNOWN_MODEL_VARS = [
+        'LD', 'DBR', 'top_layer', 'au', 'pmma1', 'd',
+        'n_DBR', 't_H', 't_L', 'fff', 'hfa',
+    ]
+
+    def _enum_model_variables(self, scope):
+        """Enumerate model/GUI variables in the given scope.
+
+        Uses multiple strategies since no single lumapi call is guaranteed:
+          1. Try lumapi list-variables call (name unverified — try/except)
+          2. Fallback: regex-scan setup+analysis scripts for addvar/adduserprop
+          3. Append known model variable names from _KNOWN_MODEL_VARS
+        Each name is resolved via getnamed (or getvar if getnamed fails).
+        """
+        names = []
+        # Strategy 1: try lumapi function to list variables (if exists)
+        for cand in ('getvars', 'listvars', 'dumpvars'):
+            try:
+                r = appCall(self._fsp, cand, [])
+                raw = str(r) if r else ''
+                if raw:
+                    parsed = [n.strip() for n in raw.replace('\n', ',').split(',') if n.strip()]
+                    if parsed:
+                        names = parsed
+                        break
+            except Exception:
+                pass
+
+        # Strategy 2: regex scan scripts for addvar / adduserprop
+        if not names:
+            try:
+                scr = self._cmd_get_script({'name': scope})
+                text = (scr.get('setup_script', '') or '') + '\n' + (scr.get('analysis_script', '') or '')
+                var_names = re.findall(r'addvar\(\s*"(\w+)"', text)
+                prop_names = re.findall(r'adduserprop\(\s*"(\w+)"', text)
+                names = list(set(var_names + prop_names))
+            except Exception:
+                pass
+
+        # Strategy 3: always probe known names
+        for kn in self._KNOWN_MODEL_VARS:
+            if kn not in names:
+                names.append(kn)
+
+        # Resolve values via getnamed (getvar as fallback)
+        out = {}
+        for vn in names:
+            if not vn:
+                continue
+            val = None
+            for fn in ('getnamed', 'getvar'):
+                try:
+                    val = appCall(self._fsp, fn, [scope, vn])
+                    val = self._sanitize(val)
+                    if val is not None:
+                        break
+                except Exception:
+                    pass
+            if val is not None:
+                out[vn] = val
+        return out
+
+    def _cmd_get_model_variables(self, p):
+        """Read GUI Model Variables table."""
+        if not self._fsp:
+            raise RuntimeError('No open project')
+        name = p.get('name', '::model')
+        variables = self._enum_model_variables(name)
+        return {'scope': name, 'variables': variables,
+                'count': len(variables)}
+
+    def _cmd_get_model_overview(self, p):
+        """One-call self-introspection: objects + variables + materials + FDTD summary.
+
+        Designed to stop the LLM from skipping steps — everything needed for
+        modeling + script writing in one dict. Scripts pulled separately via get_script.
+        """
+        if not self._fsp:
+            raise RuntimeError('No open project')
+        enabled_only = bool(p.get('enabled_only', True))
+        include_full = bool(p.get('include_full', False))
+
+        prop_list = self._SCENE_PROPS if include_full else self._LIGHT_PROPS
+
+        # 1) Objects (light unless include_full=true)
+        objects = []
+        seen = set()
+        self._traverse('::model', prop_list, enabled_only, objects, seen)
+
+        # 2) Model variables
+        variables = self._enum_model_variables('::model')
+
+        # 3) Materials — list known materials via probing
+        materials = []
+        try:
+            # getmaterial with no specific name returns a list in some versions
+            raw = appCall(self._fsp, 'getmaterial', [])
+            if raw:
+                raw_str = str(raw)
+                for m in raw_str.replace('\n', ',').split(','):
+                    m = m.strip()
+                    if m and m != '():':
+                        materials.append(m)
+        except Exception:
+            pass
+
+        # 4) FDTD summary
+        fdtd_summary = {}
+        for k in ['dimension', 'x span', 'y span', 'z span',
+                  'simulation time', 'mesh accuracy']:
+            try:
+                fdtd_summary[k] = self._fsp.getnamed('FDTD', k)
+            except Exception:
+                pass
+
+        return {
+            'objects': objects,
+            'object_count': len(objects),
+            'model_variables': variables,
+            'variable_count': len(variables),
+            'materials': materials,
+            'fdtd_summary': fdtd_summary,
+        }
+
+    # ------------------------------------------------------------------
+    # Single object info (P0-3)
+    # ------------------------------------------------------------------
+
+    def _classify_source(self, t):
+        """Return explicit source_kind label from object type string."""
+        if not t:
+            return None
+        s = t.lower()
+        if 'dipole' in s:
+            return 'dipole'
+        if 'tfsf' in s:
+            return 'tfsf'
+        if 'plane' in s:
+            return 'plane'
+        if 'gaussian' in s:
+            return 'gaussian'
+        if 'mode' in s:
+            return 'mode-source'
+        return None
+
+    def _cmd_get_object_info(self, p):
+        """Get full properties of ONE named object with type discriminator."""
+        if not self._fsp:
+            raise RuntimeError('No open project')
+        name = p['name']
+        out = {'name': name}
+        try:
+            t = appCall(self._fsp, 'getnamed', [name, 'type'])
+            t_str = str(t)
+            out['type'] = t_str
+            sk = self._classify_source(t_str)
+            if sk:
+                out['source_kind'] = sk
+        except Exception as e:
+            return {'name': name, 'error': 'not found', 'detail': str(e)[:200]}
+        for prop in self._SCENE_PROPS:
+            try:
+                out[prop] = self._sanitize(
+                    appCall(self._fsp, 'getnamed', [name, prop]))
+            except Exception:
+                pass
+        return out
 
     def _cmd_get_script(self, p):
         if not self._fsp: raise RuntimeError('No open project')
@@ -484,6 +670,15 @@ class FdtdBridge(object):
     # Results
     # ------------------------------------------------------------------
 
+    # Common known dataset field names (fallback if field enumeration fails)
+    _COMMON_RESULT_FIELDS = [
+        'f', 'lambda', 'x', 'y', 'z',
+        'Ex', 'Ey', 'Ez', 'Hx', 'Hy', 'Hz',
+        'T', 'R', 'P', 'power', 'T_total',
+        'index', 'index_x', 'index_y', 'index_z',
+        'intensity', 'E', 'H',
+    ]
+
     def _cmd_get_results(self, p):
         if not self._fsp: raise RuntimeError('No open project')
         name = p.get('name', 'FDTD')
@@ -493,20 +688,83 @@ class FdtdBridge(object):
         except Exception as e:
             return {'name': name, 'results': [], 'error': str(e)[:200]}
 
+    def _cmd_list_result_fields(self, p):
+        """List field names in a result dataset WITHOUT fetching full data.
+
+        Probes common known field names via getv(dataset.field) to discover
+        which fields are accessible. Returns just the field names (no data)
+        so LLM can preview monitor structure before calling get_result_data.
+        """
+        if not self._fsp: raise RuntimeError('No open project')
+        monitor = p['monitor']
+        data = p.get('data', '')
+        try:
+            if data:
+                self._fsp.eval('_br_lf = getresult("' + monitor + '","' + data + '");')
+            else:
+                self._fsp.eval('_br_lf = getresult("' + monitor + '");')
+            # Probe common field names to see which are accessible
+            present = []
+            for cf in self._COMMON_RESULT_FIELDS:
+                try:
+                    v = self._fsp.getv('_br_lf.' + cf)
+                    if v is not None:
+                        present.append(cf)
+                except Exception:
+                    pass
+            self._fsp.eval('clear(_br_lf);')
+            return {'monitor': monitor, 'data': data, 'fields': present,
+                    'count': len(present)}
+        except Exception as e:
+            return {'monitor': monitor, 'data': data,
+                    'error': str(e)[:300], 'fields': []}
+
     def _cmd_get_result_data(self, p):
         if not self._fsp: raise RuntimeError('No open project')
-        monitor, data = p['monitor'], p.get('data', '')
+        monitor = p['monitor']
+        data = p.get('data', '')
+        fields = p.get('fields', None)
+        cap = int(p.get('cap', 2000))
         try:
-            self._fsp.eval('_br_d = getresult("' + monitor + '","' + data + '");')
-            fv = self._fsp.getv('_br_d.f')
-            lv = self._fsp.getv('_br_d.lambda')
+            if data:
+                self._fsp.eval('_br_d = getresult("' + monitor + '","' + data + '");')
+            else:
+                self._fsp.eval('_br_d = getresult("' + monitor + '");')
+
+            # If no explicit field list, probe common fields
+            if not fields or len(fields) == 0:
+                fields = []
+                for cf in self._COMMON_RESULT_FIELDS:
+                    try:
+                        v = self._fsp.getv('_br_d.' + cf)
+                        if v is not None:
+                            fields.append(cf)
+                    except Exception:
+                        pass
+
+            out = {'monitor': monitor, 'data': data,
+                   'fields_available': fields, 'values': {}}
+            truncated = {}
+            for fld in fields:
+                try:
+                    v = self._fsp.getv('_br_d.' + fld)
+                    if v is None:
+                        continue
+                    sv = self._sanitize(v)
+                    if isinstance(sv, list) and len(sv) > cap:
+                        out['values'][fld] = sv[:cap]
+                        truncated[fld] = len(sv)
+                    else:
+                        out['values'][fld] = sv
+                except Exception:
+                    pass
+            if truncated:
+                out['truncated'] = truncated
+                out['cap'] = cap
             self._fsp.eval('clear(_br_d);')
-            r = {'monitor': monitor, 'data': data}
-            if fv is not None: r['f'] = self._sanitize(fv)
-            if lv is not None: r['lambda'] = self._sanitize(lv)
-            return r
+            return out
         except Exception as e:
-            return {'error': str(e)[:300]}
+            return {'error': str(e)[:300], 'monitor': monitor, 'data': data}
 
     def _cmd_get_result_file(self, p):
         if not self._fsp: raise RuntimeError('No open project')
@@ -519,6 +777,26 @@ class FdtdBridge(object):
             return {'file': out, 'status': 'ok'}
         except Exception as e:
             return {'error': str(e)[:300]}
+
+    def _cmd_has_result(self, p):
+        """Check whether a monitor/element has results without throwing."""
+        if not self._fsp: raise RuntimeError('No open project')
+        name = p['name']
+        # First try direct lumapi call (if it exists)
+        for fn in ('haveresult', 'findresult', 'hasresult'):
+            try:
+                r = appCall(self._fsp, fn, [name])
+                if r is not None:
+                    return {'name': name, 'exists': bool(r), 'check_method': fn}
+            except Exception:
+                pass
+        # Fallback: try getresult and see if it succeeds
+        try:
+            r = appCall(self._fsp, 'getresult', [name])
+            return {'name': name, 'exists': r is not None and str(r).strip() != '',
+                    'check_method': 'getresult_attempt'}
+        except Exception:
+            return {'name': name, 'exists': False, 'check_method': 'exception_caught'}
 
     # ------------------------------------------------------------------
     # Simulation

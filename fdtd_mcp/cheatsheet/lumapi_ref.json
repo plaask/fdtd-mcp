@@ -1,0 +1,415 @@
+{
+  "meta": {
+    "scope": "Commonly-used Lumerical script API subset — NOT exhaustive. If a function is not listed here, do NOT assume its signature; call get_lumapi_ref(list_only=true) or check Lumerical documentation.",
+    "verified_against": "pending",
+    "note": "Each entry's verified_against should be updated to the Lumerical version (e.g. '241') after live verification. Mark 'pending' until then."
+  },
+  "getresult": {
+    "signature": "getresult(\"name\")  or  getresult(\"name\", \"property\")",
+    "returns": "dataset object — fields accessed with .f, .lambda, .Ex, .Ey, .Ez, .Hx, .Hy, .Hz, .x, .y, .z, .T, .R, .P, .power depending on monitor type",
+    "valid_args": {
+      "name": "monitor name (e.g. 'DFT', 'index') or 'FDTD' for global results",
+      "property": "dataset name, e.g. 'E', 'H', 'T', 'P', 'index' — must match monitor output flags"
+    },
+    "common_pitfalls": [
+      "getresult returns a dataset object, not a scalar — use .field access (via getv) to get arrays",
+      "Second arg specifies which dataset within the monitor's results; with one arg it returns a list of available datasets"
+    ],
+    "category": "result",
+    "verified_against": "proven — used in _cmd_get_result_data"
+  },
+  "getdata": {
+    "signature": "getdata(\"monitor_name\", \"field_name\")",
+    "returns": "array of field values (not a dataset object — direct array)",
+    "valid_args": {
+      "monitor_name": "monitor or element name",
+      "field_name": "e.g. 'Ex', 'Ez', 'T', 'R', 'x', 'y', 'z'"
+    },
+    "common_pitfalls": [
+      "getdata returns a raw array, not a dataset — preferred when you want just one field",
+      "getresult + getv(dataset.field) is equivalent but returns the whole dataset"
+    ],
+    "category": "result",
+    "verified_against": "pending"
+  },
+  "getnamed": {
+    "signature": "getnamed(\"object_name\", \"property_name\")",
+    "returns": "property value (type depends on property: float, string, array)",
+    "valid_args": {
+      "object_name": "object path, e.g. '::model', 'source_1', 'DFT'",
+      "property_name": "property name, e.g. 'type', 'x', 'y', 'z', 'enabled', 'material', 'wavelength start'"
+    },
+    "common_pitfalls": [
+      "Property names have spaces (e.g. 'x span', 'wavelength start') — use exact casing",
+      "getnamed only works for scalar/string properties; for datasets use getresult",
+      "Confirmed working for all 35+ properties in get_scene_info"
+    ],
+    "category": "general",
+    "verified_against": "proven — used extensively in get_scene_info and get_parameters"
+  },
+  "setnamed": {
+    "signature": "setnamed(\"object_name\", \"property_name\", value)",
+    "returns": "none",
+    "valid_args": {
+      "object_name": "object path",
+      "property_name": "property name (may contain spaces)",
+      "value": "new value — number, string, or array"
+    },
+    "common_pitfalls": [
+      "Does NOT work for script properties — use set() with 'setup script'/'analysis script' instead",
+      "Property names are case-sensitive and may contain spaces"
+    ],
+    "category": "general",
+    "verified_against": "proven — used in set_parameter"
+  },
+  "set": {
+    "signature": "set(\"property_name\", value)",
+    "returns": "none",
+    "valid_args": {
+      "property_name": "script property name: 'setup script', 'analysis script', 'script'",
+      "value": "new value (string for scripts, number for properties)"
+    },
+    "common_pitfalls": [
+      "set() operates on the currently selected object (select() first)",
+      "For script content, always use the set_script tool instead of execute('set(\"setup script\",...)')",
+      "For non-script properties, use setnamed() which does NOT require select()"
+    ],
+    "category": "general",
+    "verified_against": "proven — used in _cmd_set_script"
+  },
+  "addfdtd": {
+    "signature": "addfdtd()",
+    "returns": "none (creates FDTD solver region in new project)",
+    "valid_args": {},
+    "common_pitfalls": [
+      "Only needed for new blank projects (new tool calls this automatically)",
+      "Configure FDTD region via setnamed('FDTD', prop, val) after creation"
+    ],
+    "category": "object",
+    "verified_against": "proven — used in _cmd_new"
+  },
+  "addrect": {
+    "signature": "addrect()",
+    "returns": "none (creates a rectangle structure object, auto-named)",
+    "valid_args": {},
+    "common_pitfalls": [
+      "Auto-generates a name like 'rectangle_1' — capture it via select() + getnamed('name') after creation",
+      "Configure via setnamed or set_parameter tool after creation"
+    ],
+    "category": "object",
+    "verified_against": "pending"
+  },
+  "addcircle": {
+    "signature": "addcircle()",
+    "returns": "none (creates a circle/cylinder structure object, auto-named)",
+    "valid_args": {},
+    "common_pitfalls": [
+      "Same pattern as addrect — auto-named, configure after creation"
+    ],
+    "category": "object",
+    "verified_against": "pending"
+  },
+  "addtfsf": {
+    "signature": "addtfsf()",
+    "returns": "none (creates a TFSF plane wave source, auto-named)",
+    "valid_args": {},
+    "common_pitfalls": [
+      "Creates a total-field/scattered-field source — auto-named like 'TFSF_1'",
+      "Configure direction, wavelength range, injection axis via setnamed after creation"
+    ],
+    "category": "source",
+    "verified_against": "pending"
+  },
+  "addgaussian": {
+    "signature": "addgaussian()",
+    "returns": "none (creates a Gaussian beam source, auto-named)",
+    "valid_args": {},
+    "common_pitfalls": [
+      "Auto-named like 'gaussian_1'",
+      "For dipole sources use adddipole(), for plane waves use addplane()"
+    ],
+    "category": "source",
+    "verified_against": "pending"
+  },
+  "addplane": {
+    "signature": "addplane()",
+    "returns": "none (creates a plane wave source, auto-named)",
+    "valid_args": {},
+    "common_pitfalls": [
+      "Auto-named like 'plane_1'",
+      "May not exist in all Lumerical versions — use addtfsf if addplane is unavailable"
+    ],
+    "category": "source",
+    "verified_against": "pending"
+  },
+  "adddipole": {
+    "signature": "adddipole()",
+    "returns": "none (creates a dipole source, auto-named)",
+    "valid_args": {},
+    "common_pitfalls": [
+      "Auto-named like 'dipole_1'",
+      "Set dipole type (Electric/Magnetic) and polarization angle after creation via setnamed"
+    ],
+    "category": "source",
+    "verified_against": "pending"
+  },
+  "addpower": {
+    "signature": "addpower()",
+    "returns": "none (creates a 2D power monitor, auto-named)",
+    "valid_args": {},
+    "common_pitfalls": [
+      "Auto-named like 'power_1'",
+      "Set monitor type (2D/3D/1D), output flags via setnamed after creation"
+    ],
+    "category": "monitor",
+    "verified_against": "pending"
+  },
+  "addmesh": {
+    "signature": "addmesh()",
+    "returns": "none (creates a mesh override region, auto-named)",
+    "valid_args": {},
+    "common_pitfalls": [
+      "Auto-named like 'mesh_1'",
+      "Set dx/dy/dz via setnamed for mesh size override"
+    ],
+    "category": "mesh",
+    "verified_against": "pending"
+  },
+  "addmaterial": {
+    "signature": "addmaterial(\"model_type\")",
+    "returns": "auto-generated material name (string)",
+    "valid_args": {
+      "model_type": "'Sampled 3D data', 'Dielectric', 'Drude', 'Debye', 'Lorentz', etc."
+    },
+    "common_pitfalls": [
+      "Returns a generated name like 'material_1' — you MUST capture this return value",
+      "Built-in database materials (e.g. 'Au (Gold) - Johnson and Christy') need no addmaterial — just assign the name string via setnamed",
+      "After addmaterial, configure properties via setmaterial()"
+    ],
+    "category": "material",
+    "verified_against": "proven — used in _cmd_add_material"
+  },
+  "setmaterial": {
+    "signature": "setmaterial(\"name\", \"property\", value)",
+    "returns": "none",
+    "valid_args": {
+      "name": "material name (from addmaterial or built-in)",
+      "property": "'Refractive Index', 'nk data', 'mesh order', etc.",
+      "value": "number, string, or array (tabulated data)"
+    },
+    "common_pitfalls": [
+      "Property names vary by material model type — call getmaterial('name') without property to list available properties",
+      "nk data expects [wavelengths_array, n_array, k_array] in meters"
+    ],
+    "category": "material",
+    "verified_against": "proven — used in _cmd_set_material"
+  },
+  "getmaterial": {
+    "signature": "getmaterial(\"name\")  or  getmaterial(\"name\", \"property\")",
+    "returns": "with property: property value; without property: list of available property names",
+    "valid_args": {
+      "name": "material name",
+      "property": "optional property name"
+    },
+    "common_pitfalls": [
+      "Call getmaterial(name) WITHOUT property first to discover all settable property names"
+    ],
+    "category": "material",
+    "verified_against": "proven — used in _cmd_get_material"
+  },
+  "addvar": {
+    "signature": "addvar(\"name\", \"initial_value\")  (exact signature PENDING verification)",
+    "returns": "none (adds a variable to the Model Variables table)",
+    "valid_args": {
+      "name": "variable name (shown in GUI Variables tab)",
+      "initial_value": "initial value (number, string)"
+    },
+    "common_pitfalls": [
+      "Model variables declared via addvar appear in the Variables tab, NOT as getnamed(\"::model\", name) properties",
+      "Signature needs live verification against installed Lumerical version"
+    ],
+    "category": "variable",
+    "verified_against": "pending"
+  },
+  "setvar": {
+    "signature": "setvar(\"scope\", \"name\", value)  (exact signature PENDING verification)",
+    "returns": "none (sets a model variable's value in a scope)",
+    "valid_args": {
+      "scope": "'::model' or structure group name",
+      "name": "variable name",
+      "value": "new value"
+    },
+    "common_pitfalls": [
+      "Scope-aware — setvar('::model', 'LD', val) vs setvar('::model::group', 'param', val)",
+      "Signature needs live verification; getnamed may be equivalent for model-level vars"
+    ],
+    "category": "variable",
+    "verified_against": "pending"
+  },
+  "getvar": {
+    "signature": "getvar(\"scope\", \"name\")  (exact signature PENDING verification)",
+    "returns": "variable value",
+    "valid_args": {
+      "scope": "'::model' or structure group scope",
+      "name": "variable name"
+    },
+    "common_pitfalls": [
+      "Scope-aware — may differ from getnamed(\"::model\", name) for variables declared via addvar",
+      "Signature needs live verification"
+    ],
+    "category": "variable",
+    "verified_against": "pending"
+  },
+  "adduserprop": {
+    "signature": "adduserprop(\"name\", value)  — called from within an object's setup script",
+    "returns": "none (adds a user-defined property to an analysis/structure group)",
+    "valid_args": {
+      "name": "property name",
+      "value": "default value"
+    },
+    "common_pitfalls": [
+      "adduserprop is called in setup scripts (not directly via execute)",
+      "Properties created via adduserprop are read via getnamed(obj, \"name\")",
+      "Currently discovered by regex-scanning setup script text in get_parameters"
+    ],
+    "category": "variable",
+    "verified_against": "proven — regex-scanned in get_parameters"
+  },
+  "select": {
+    "signature": "select(\"object_name\")",
+    "returns": "none (selects an object, making it the target for subsequent operations)",
+    "valid_args": {
+      "object_name": "full path or relative name of an object"
+    },
+    "common_pitfalls": [
+      "Many Lumerical functions (set, get, delete) operate on the CURRENTLY SELECTED object — call select() first",
+      "selectall() selects all objects in the current scope",
+      "groupscope('::model') resets to root scope before select()"
+    ],
+    "category": "general",
+    "verified_against": "proven — used in _cmd_get_script and _cmd_execute"
+  },
+  "delete": {
+    "signature": "delete() — no arguments!",
+    "returns": "none (deletes the currently selected object)",
+    "valid_args": {},
+    "common_pitfalls": [
+      "delete() takes NO arguments — first call select('name') then delete()",
+      "The execute tool handles delete(\"name\") automatically by wrapping select+delete",
+      "In Lumerical script LSF: delete; — no parentheses"
+    ],
+    "category": "general",
+    "verified_against": "proven — special-cased in _cmd_execute"
+  },
+  "getsweepresult": {
+    "signature": "getsweepresult(\"sweep_name\")",
+    "returns": "sweep result data structure",
+    "valid_args": {
+      "sweep_name": "name of the parameter sweep (as defined in the Sweep editor)"
+    },
+    "common_pitfalls": [
+      "Throws an error if the sweep has not been run yet — use get_sweep_info first",
+      "For individual monitor results within a sweep, access via getresult inside the sweep's analysis script"
+    ],
+    "category": "sweep",
+    "verified_against": "proven — used in _cmd_get_sweep_info"
+  },
+  "farfield": {
+    "signature": "farfield()  (exact behavior PENDING verification)",
+    "returns": "none (performs far-field projection on selected monitor in analysis mode)",
+    "valid_args": {},
+    "common_pitfalls": [
+      "Must be called in analysis mode (switchtolayout first to go back, then run?)",
+      "farfieldfilter(α) sets the numerical aperture filter (α∈[0,1]) — α=0.8 is valid but filters at NA=0.8",
+      "Results accessed via farfield3d() / farfieldpolar() after farfield() call"
+    ],
+    "category": "analysis",
+    "verified_against": "pending"
+  },
+  "farfield3d": {
+    "signature": "farfield3d()  (exact behavior PENDING verification)",
+    "returns": "3D far-field amplitude/phase data",
+    "valid_args": {},
+    "common_pitfalls": [
+      "Should be called after farfield() projection has been computed",
+      "Returns angular distribution data"
+    ],
+    "category": "analysis",
+    "verified_against": "pending"
+  },
+  "farfieldpolar": {
+    "signature": "farfieldpolar(\"monitor_name\", ...)  (exact signature PENDING verification)",
+    "returns": "polar far-field data array (angle, amplitude, phase)",
+    "valid_args": {
+      "monitor_name": "name of the far-field monitor"
+    },
+    "common_pitfalls": [
+      "farfieldpolar3d exists — 3D polar data",
+      "farfieldpolar2d exists — 2D polar cross-section"
+    ],
+    "category": "analysis",
+    "verified_against": "pending"
+  },
+  "transmission": {
+    "signature": "transmission(\"monitor_name\")  (exact signature PENDING verification)",
+    "returns": "transmission spectrum (array, indexed by frequency)",
+    "valid_args": {
+      "monitor_name": "name of a power monitor"
+    },
+    "common_pitfalls": [
+      "Returns total transmission (T) through the monitor plane",
+      "For polarization-resolved transmission use getresult + field component"
+    ],
+    "category": "analysis",
+    "verified_against": "pending"
+  },
+  "dipolepower": {
+    "signature": "dipolepower()  (exact signature PENDING verification)",
+    "returns": "total power emitted by a dipole source",
+    "valid_args": {},
+    "common_pitfalls": [
+      "Returns the total radiated power — useful for normalizing Purcell factor calculations",
+      "Must be called in analysis mode with the dipole as an active source"
+    ],
+    "category": "analysis",
+    "verified_against": "pending"
+  },
+  "haveresult": {
+    "signature": "haveresult(\"name\")  (exact signature PENDING verification)",
+    "returns": "1 (true) or 0 (false) — whether the named result exists",
+    "valid_args": {
+      "name": "monitor or element name"
+    },
+    "common_pitfalls": [
+      "Use this BEFORE getresult to avoid errors when no results exist yet",
+      "Only available in analysis mode (after run)"
+    ],
+    "category": "result",
+    "verified_against": "pending"
+  },
+  "matlabsave": {
+    "signature": "matlabsave(\"filepath.mat\", variable)",
+    "returns": "none (saves workspace variable to .mat file)",
+    "valid_args": {
+      "filepath.mat": "output path with .mat extension",
+      "variable": "workspace variable name to save"
+    },
+    "common_pitfalls": [
+      "Saves to Lumerical's working directory unless absolute path is given",
+      "For result datasets: matlabsave('out.mat', _br_d) after _br_d = getresult(...)"
+    ],
+    "category": "result",
+    "verified_against": "proven — used in _cmd_get_result_file"
+  },
+  "switchtolayout": {
+    "signature": "switchtolayout()",
+    "returns": "none (switches FDTD solver to layout mode)",
+    "valid_args": {},
+    "common_pitfalls": [
+      "After running a simulation, you're in analysis mode — switchtolayout() returns to layout mode for editing",
+      "Saving and reopening a .fsp also returns to layout mode"
+    ],
+    "category": "general",
+    "verified_against": "pending"
+  }
+}

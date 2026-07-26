@@ -87,17 +87,19 @@ claude mcp add fdtd -- python -m fdtd_mcp.server
 }
 ```
 
-## 工具（21 个）
+## 工具（27 个）
 
 | 类别 | 工具 |
 |------|------|
 | 生命周期 | `new`, `open`, `close`, `save` |
-| 审阅 | `get_scene_info`, `get_script`, `get_parameters`, `get_results`, `get_sweep_info` |
+| 总览 | `get_model_overview` |
+| 审阅 | `get_scene_info`, `get_object_info`, `get_model_variables`, `get_script`, `get_parameters`, `get_sweep_info` |
+| 知识库 | `get_lumapi_ref` |
 | 编辑 | `set_parameter`, `set_script` |
 | 执行 | `execute`, `execute_file` |
 | 材料 | `add_material`, `set_material`, `get_material` |
 | 运行 | `run`, `run_sweep`, `get_sweep_result` |
-| 数据 | `get_result_data`, `get_result_file` |
+| 数据 | `get_results`, `list_result_fields`, `get_result_data`, `get_result_file`, `has_result` |
 
 ## 使用示例
 
@@ -105,9 +107,28 @@ claude mcp add fdtd -- python -m fdtd_mcp.server
 
 ```
 open("my_sim.fsp")
-get_scene_info()                 → 所有对象 + 属性
-get_script("::model")            → setup + analysis 脚本
-get_parameters()                 → 全部模型和分组参数
+get_model_overview()                 → 对象、变量、材料（单次自省，防跳步）
+get_script("::model")                → setup + analysis 脚本
+get_parameters()                     → 全部模型和分组参数
+```
+
+### 抗幻觉工作流
+
+大模型对 Lumerical FDTD 的训练语料稀缺，容易臆造函数名、对象类型和变量名。以下工具帮助解决：
+
+```
+get_model_overview()                 → 对象（默认过滤禁用）、
+                                        GUI 模型变量（LD, DBR, top_layer, au, ...）、
+                                        材料清单 — 一次拿到全部上下文
+
+get_lumapi_ref(list_only=true)       → 写脚本前确认函数名是否存在
+                                        （内置 32 条常用 API 签名库）
+
+get_object_info("source_1")          → 显式类型 + source_kind 判别器
+                                        （dipole / plane / tfsf / gaussian）
+
+脚本扫描                              → execute() 和 set_script() 对不能识别的
+                                        函数名返回非阻塞警告
 ```
 
 ### 修改并保存
@@ -122,8 +143,13 @@ save("my_sim_v2.fsp")
 
 ```
 run()
-get_results("monitor1")          → 列出可用数据集
-get_result_data("monitor1", "T") → 波长/透射率
+get_results("monitor1")              → 列出可用数据集
+list_result_fields("monitor1", "E")  → 预览字段名（Ex, Ey, Ez, ...）
+get_result_data("monitor1", "E", fields=["Ex","T","f"])
+                                     → 多字段数据（不再限于 f/lambda）
+has_result("monitor1")               → 安全存在性检查，取数据前先调用
+get_result_file("monitor1", "E", "C:/data/fields.mat")
+                                     → 完整导出为 .mat 文件
 ```
 
 ### 从零搭建
@@ -162,7 +188,9 @@ fdtd-mcp/
     ├── __init__.py
     ├── discovery.py   # Lumerical 路径自动发现
     ├── bridge.py      # JSON-RPC 桥接
-    └── server.py      # MCP 服务器
+    ├── server.py      # MCP 服务器
+    └── cheatsheet/
+        └── lumapi_ref.json  # 32 条 Lumerical API 参考
 ```
 
 ## 依赖

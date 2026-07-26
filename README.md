@@ -87,17 +87,19 @@ If auto-detection fails, add the `--lumerical-home` argument:
 }
 ```
 
-## Tools (21)
+## Tools (27)
 
 | Category | Tools |
 |----------|-------|
 | Lifecycle | `new`, `open`, `close`, `save` |
-| Inspect | `get_scene_info`, `get_script`, `get_parameters`, `get_results`, `get_sweep_info` |
+| Overview | `get_model_overview` |
+| Inspect | `get_scene_info`, `get_object_info`, `get_model_variables`, `get_script`, `get_parameters`, `get_sweep_info` |
+| Knowledge | `get_lumapi_ref` |
 | Edit | `set_parameter`, `set_script` |
 | Execute | `execute`, `execute_file` |
 | Materials | `add_material`, `set_material`, `get_material` |
 | Run | `run`, `run_sweep`, `get_sweep_result` |
-| Data | `get_result_data`, `get_result_file` |
+| Data | `get_results`, `list_result_fields`, `get_result_data`, `get_result_file`, `has_result` |
 
 ## Usage examples
 
@@ -105,9 +107,29 @@ If auto-detection fails, add the `--lumerical-home` argument:
 
 ```
 open("my_sim.fsp")
-get_scene_info()                 → all objects + properties
-get_script("::model")            → setup + analysis scripts
-get_parameters()                 → all model & group parameters
+get_model_overview()                 → objects, variables, materials (one call — anti-skip-step)
+get_script("::model")                → setup + analysis scripts
+get_parameters()                     → all model & group parameters
+```
+
+### Anti-hallucination workflow
+
+LLMs are undertrained on Lumerical FDTD and often hallucinate function names, object types, and variable names. These tools help:
+
+```
+get_model_overview()                 → objects (disabled filtered by default),
+                                        GUI model variables (LD, DBR, top_layer, au, ...),
+                                        and material list — all in one call
+
+get_lumapi_ref(list_only=true)       → before writing scripts, verify
+                                        the function name exists in the
+                                        bundled 32-entry cheatsheet
+
+get_object_info("source_1")          → explicit type + source_kind discriminator
+                                        (dipole vs plane vs tfsf vs gaussian)
+
+Script scanning                      → execute() and set_script() warn about
+                                        unrecognized function names non-blockingly
 ```
 
 ### Edit and save
@@ -122,8 +144,13 @@ save("my_sim_v2.fsp")
 
 ```
 run()
-get_results("monitor1")          → list available datasets
-get_result_data("monitor1", "T") → wavelength/transmission
+get_results("monitor1")              → list available datasets
+list_result_fields("monitor1", "E")  → preview field names (Ex, Ey, Ez, ...)
+get_result_data("monitor1", "E", fields=["Ex","T","f"])
+                                     → multi-field data (not just f/lambda)
+has_result("monitor1")               → safe existence check before fetching
+get_result_file("monitor1", "E", "C:/data/fields.mat")
+                                     → full export to .mat file
 ```
 
 ### Build from scratch
@@ -162,7 +189,9 @@ fdtd-mcp/
     ├── __init__.py
     ├── discovery.py      # auto-detect Lumerical installation
     ├── bridge.py         # JSON-RPC bridge (Lumerical Python 3.6.8)
-    └── server.py         # MCP server (system Python)
+    ├── server.py         # MCP server (system Python)
+    └── cheatsheet/
+        └── lumapi_ref.json  # 32-entry Lumerical API reference
 ```
 
 ## Requirements

@@ -618,7 +618,7 @@ class FdtdBridge(object):
         if not self._fsp: raise RuntimeError('No open project')
         name = p['name']
         prop = p['property']
-        value = p['value']
+        value = self._to_lum_array(p['value'])
         appCall(self._fsp, 'setmaterial', [name, prop, value])
         return {'status': 'ok', 'name': name, 'property': prop}
 
@@ -823,6 +823,24 @@ class FdtdBridge(object):
     # ------------------------------------------------------------------
     # Helpers
     # ------------------------------------------------------------------
+
+    def _to_lum_array(self, value):
+        """Convert Python numeric lists to numpy ndarray for appCall.
+
+        Lumapi's appCall marshals list -> MATLAB cell array (wrong for
+        setmaterial/setnamed numeric matrix args), but ndarray -> numeric
+        matrix. Only numeric leaf lists are converted; strings, empty lists,
+        and non-numeric lists pass through unchanged.
+        """
+        if isinstance(value, list) and len(value) > 0:
+            try:
+                import numpy as np
+                arr = np.array(value)
+                if arr.dtype.kind in ('i', 'f', 'u'):
+                    return arr
+            except Exception:
+                pass
+        return value
 
     def _sanitize(self, value):
         if value is None: return None

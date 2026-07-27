@@ -233,19 +233,22 @@ TOOLS = [
         description=(
             'Set a material property.\n'
             '\n'
-            'Common properties:\n'
-            '  "Refractive Index"  → constant n (for Dielectric type)\n'
-            '  "nk data"           → tabulated [wavelengths, n, k] arrays (for Sampled 3D data)\n'
-            '  "mesh order"        → mesh priority override\n'
+            'Common properties (name depends on material type — check with get_material first):\n'
+            '  "Refractive Index"  \u2192 constant n (for Dielectric type)\n'
+            '  "sampled 3d data"   \u2192 Nx2 array [[wl,n],...] with optional k (for Sampled 3D data)\n'
+            '  "mesh order"        \u2192 mesh priority override\n'
+            '  "name"             \u2192 rename the material\n'
             '\n'
             'Examples:\n'
             '  set_material(name="mat1", property="Refractive Index", value=1.5)\n'
             '  set_material(name="mat1", property="mesh order", value=2)\n'
-            '  set_material(name="mat1", property="nk data", value=[[300e-9,800e-9],[1.5,1.5],[0,0]])\n'
+            '  set_material(name="mat1", property="sampled 3d data", value=[[300e-9,1.5,0],[800e-9,1.5,0]])\n'
             '\n'
-            'Tip: Call set_material(name) WITHOUT property first to see all settable property names.'
+            'For large nk datasets, prefer file import:\n'
+            '  execute("importnk(\\"C:/path/to/nk_data.txt\\")")\n'
+            'Tip: Call get_material(name) WITHOUT property first to see all settable property names.'
         ),
-        inputSchema={'type':'object','properties':{'name':{'type':'string'},'property':{'type':'string','description':'e.g. "Refractive Index", "nk data", "mesh order"'},'value':{'description':'Property value: number, string, or array'}},'required':['name','property','value']}),
+        inputSchema={'type':'object','properties':{'name':{'type':'string'},'property':{'type':'string','description':'e.g. "Refractive Index", "sampled 3d data", "mesh order", "name"'},'value':{'description':'Property value: number, string, or numeric array'}},'required':['name','property','value']}),
     types.Tool(name='get_material',
         description=(
             'Read material properties.\n'
@@ -555,6 +558,7 @@ _LSF_BUILTINS = frozenset({
     'length', 'size', 'find', 'sprintf', 'str2num', 'num2str',
     'type', 'eval', 'feval', 'run', 'runsweep',
     'write', 'read', 'matlabsave', 'load',
+    'readdata', 'loaddata', 'importdataset', 'importnk', 'readspectrum',
     'switchtolayout', 'layoutmode', 'analysismode',
     'addfdtd', 'addrect', 'addcircle', 'addring',
     'addtfsf', 'addgaussian', 'addplane', 'adddipole',

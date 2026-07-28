@@ -87,94 +87,151 @@ If auto-detection fails, add the `--lumerical-home` argument:
 }
 ```
 
-## Tools (27)
+## Tools (30 tools, 6 modules)
 
-| Category | Tools |
-|----------|-------|
-| Lifecycle | `new`, `open`, `close`, `save` |
-| Overview | `get_model_overview` |
-| Inspect | `get_scene_info`, `get_object_info`, `get_model_variables`, `get_script`, `get_parameters`, `get_sweep_info` |
-| Knowledge | `get_lumapi_ref` |
-| Edit | `set_parameter`, `set_script` |
-| Execute | `execute`, `execute_file` |
-| Materials | `add_material`, `set_material`, `get_material` |
-| Run | `run`, `run_sweep`, `get_sweep_result` |
-| Data | `get_results`, `list_result_fields`, `get_result_data`, `get_result_file`, `has_result` |
+```
+session (5)     session_open, session_new, session_close,
+                session_save, session_save_as
+
+model (6)       model_info, model_add, model_get, model_set,
+                model_delete, model_script
+
+material (5)    material_add, material_get, material_set,
+                material_delete, material_exists
+
+sweep (6)       sweep_add, sweep_get, sweep_set, sweep_delete,
+                sweep_run, sweep_result
+
+result (4)      result_list, result_get, result_save, result_has
+
+engine (4)      run, execute, execute_file, reference_lookup
+```
+
+### Module overview
+
+| Module | Purpose | Tools |
+|--------|---------|-------|
+| **session** | Project file lifecycle | `session_open`, `session_new`, `session_close`, `session_save`, `session_save_as` |
+| **model** | Object tree unified CRUD | `model_info`, `model_add`, `model_get`, `model_set`, `model_delete`, `model_script` |
+| **material** | Material database | `material_add`, `material_get`, `material_set`, `material_delete`, `material_exists` |
+| **sweep** | Parameter sweep lifecycle | `sweep_add`, `sweep_get`, `sweep_set`, `sweep_delete`, `sweep_run`, `sweep_result` |
+| **result** | Simulation data | `result_list`, `result_get`, `result_save`, `result_has` |
+| **engine** | Direct engine interaction | `run`, `execute`, `execute_file`, `reference_lookup` |
+
+### model_add type table
+
+| type | Lumerical command | Category |
+|------|-------------------|----------|
+| `rectangle`, `circle`, `ring`, `polygon`, `sphere`, `pyramid`, `triangle`, `waveguide` | `addrect`, `addcircle`, ... | Geometry |
+| `fdtd` | `addfdtd` | Solver |
+| `mesh` | `addmesh` | Mesh |
+| `dipole`, `tfsf`, `plane`, `gaussian`, `mode_source` | `adddipole`, `addtfsf`, ... | Source |
+| `power_monitor`, `dft_monitor`, `index_monitor`, `field_monitor`, `movie_monitor` | `addpower`, `adddftmonitor`, ... | Monitor |
+| `structure_group`, `analysis_group` | `addstructuregroup`, `addanalysisgroup` | Group |
 
 ## Usage examples
 
 ### Open and inspect
 
 ```
-open("my_sim.fsp")
-get_model_overview()                 → objects, variables, materials (one call — anti-skip-step)
-get_script("::model")                → setup + analysis scripts
-get_parameters()                     → all model & group parameters
+session_open("D:/project/my_sim.fsp")
+model_info()                           → objects, materials, variables, FDTD summary (one call)
+model_get("FDTD")                      → full properties of the FDTD region
+model_script("::model", action="get")  → setup + analysis scripts
 ```
 
-### Anti-hallucination workflow
-
-LLMs are undertrained on Lumerical FDTD and often hallucinate function names, object types, and variable names. These tools help:
+### Build from scratch
 
 ```
-get_model_overview()                 → objects (disabled filtered by default),
-                                        GUI model variables (LD, DBR, top_layer, au, ...),
-                                        and material list — all in one call
+session_new(dimension="3D", x_span=2e-6, y_span=2e-6, mesh_accuracy=4)
 
-get_lumapi_ref(list_only=true)       → before writing scripts, verify
-                                        the function name exists in the
-                                        bundled 32-entry cheatsheet
+# Add objects
+model_add(type="fdtd")
+model_add(type="rectangle", name="substrate",
+          properties={"x span": 2e-6, "y span": 2e-6, "z span": 200e-9})
+model_add(type="dipole", name="source_1")
 
-get_object_info("source_1")          → explicit type + source_kind discriminator
-                                        (dipole vs plane vs tfsf vs gaussian)
-
-Script scanning                      → execute() and set_script() warn about
-                                        unrecognized function names non-blockingly
+# Set properties
+model_set("substrate", {"material": "Si (Silicon) - Palik"})
+model_set("source_1", {"x": 0, "y": 0, "z": 100e-9, "wavelength start": 500e-9})
+session_save("new_sim.fsp")
 ```
 
-### Edit and save
+### Custom materials
 
 ```
-set_parameter("wavelength", 1550e-9)
-set_script("::model", "analysis", "plot_spectrum();")
-save("my_sim_v2.fsp")
+material_add(type="Sampled 3D data")                      → {name: "material_1"}
+material_set("material_1", "name", "PA_RCP")
+material_set("material_1", "sampled 3d data",
+  [[300e-9, 1.5+0.001i], [800e-9, 1.5+0.001i]])          # Nx2 [wl, n+ik]
+material_set("material_1", "mesh order", 2)
+
+# Assign to an object
+model_set("substrate", {"material": "PA_RCP"})
+
+# Or import from file
+execute('importnk("D:/data/nk_data.txt")')
+model_set("substrate", {"material": "nk_data"})
+```
+
+### Structure groups and analysis groups
+
+```
+# Create a structure group with script
+model_add(type="structure_group", name="dbr_stack")
+model_set("dbr_stack", {"x": 0, "y": 0})
+model_script("dbr_stack", action="set", script_type="script",
+  content="addrect(); set('name', 'layer'); set('x span', 2e-6);")
+
+# Create an analysis group
+model_add(type="analysis_group", name="transmission_calc")
+model_script("transmission_calc", action="set", script_type="setup",
+  content="addpower(); set('name', 'monitor');")
+model_script("transmission_calc", action="set", script_type="analysis",
+  content="T = transmission('monitor');")
 ```
 
 ### Run and get data
 
 ```
 run()
-get_results("monitor1")              → list available datasets
-list_result_fields("monitor1", "E")  → preview field names (Ex, Ey, Ez, ...)
-get_result_data("monitor1", "E", fields=["Ex","T","f"])
-                                     → multi-field data (not just f/lambda)
-has_result("monitor1")               → safe existence check before fetching
-get_result_file("monitor1", "E", "C:/data/fields.mat")
-                                     → full export to .mat file
+result_has("monitor")                  → check before fetching
+result_list("monitor")                 → discover available datasets
+result_get("monitor", data="E",
+  fields=["Ex", "Ey", "f"])           → get specific fields (fields is REQUIRED)
+result_save("monitor", data="E",
+  output="C:/data/fields.mat")        → export to .mat file
 ```
 
-### Build from scratch
+### Parameter sweeps
 
 ```
-new(dimension="3D", x_span=2e-6, y_span=2e-6, z_span=2e-6, mesh_accuracy=4)
-execute("addrect()")
-set_parameter("x span", 500e-9, object="rectangle")
-set_parameter("material", "Si (Silicon) - Palik", object="rectangle")
-execute("addfdtd()")
-save("new_sim.fsp")
+# Create and run
+sweep_add(type=0, name="thickness_sweep",
+  parameters=[{
+    "Name": "t", "Parameter": "::model::substrate::z span",
+    "Type": "Length", "Start": 50e-9, "Stop": 300e-9
+  }],
+  results=[{"Name": "T", "Result": "::model::monitor::T"}])
+sweep_run("thickness_sweep")
+sweep_result("thickness_sweep", "T")   → get sweep data
 ```
 
-### Custom materials
+### Anti-hallucination
 
 ```
-add_material(type="Sampled 3D data")                 → {name: "material_1"}
-set_material("material_1", "nk data",
-  [[300e-9,800e-9], [1.52,1.52], [0.001,0.001]])
-set_material("material_1", "mesh order", 2)
-# Built-in materials need no setup:
-execute("addrect()")
-set_parameter("material", "Au (Gold) - Johnson and Christy", object="rectangle")
+reference_lookup(list_only=true)       → verify function names exist
+reference_lookup(name="addrect")       → get signature + pitfalls
+execute("?getnamed('FDTD', 'dimension')")  → ?expr captures return value
 ```
+
+## Key design principles
+
+- **Unified CRUD** — every module uses consistent `add`/`get`/`set`/`delete` naming
+- **Execute is transparent** — `execute(code)` passes LSF directly to the engine with no parsing
+- **model_set handles variables automatically** — uses `addvar`/`addanalysisprop`/`adduserprop` based on object type
+- **result_get requires fields** — call `result_list` first to discover available fields, then request only what you need
+- **Short names resolve** — `model_get("FDTD")` works without the `::model::` prefix
 
 ## Files
 
@@ -191,7 +248,7 @@ fdtd-mcp/
     ├── bridge.py         # JSON-RPC bridge (Lumerical Python 3.6.8)
     ├── server.py         # MCP server (system Python)
     └── cheatsheet/
-        └── lumapi_ref.json  # 32-entry Lumerical API reference
+        └── lumapi_ref.json  # Lumerical API reference
 ```
 
 ## Requirements

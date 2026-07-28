@@ -4,7 +4,7 @@ FDTD Bridge — JSON-RPC via stdin/stdout.
 
 Runs on Lumerical embed Python 3.6.8.
 Uses lumapi Python methods (appCall-backed) instead of eval() for reliability.
-Single-line eval() ONLY for simple expressions.
+Uses _call_lsf as a unified entry point that auto-converts lists to ndarrays.
 """
 from __future__ import print_function
 import sys, os, json, re, traceback
@@ -37,6 +37,48 @@ class FdtdBridge(object):
         self._fsp = None
         self._path = None
         self._tmp_dir = os.environ.get('TEMP', os.environ.get('TMP', '/tmp'))
+        self._method_map = {
+            'ping': self._cmd_ping,
+            'open': self._cmd_open,
+            'close': self._cmd_close,
+            'save': self._cmd_save,
+            'new': self._cmd_new,
+            'execute': self._cmd_execute,
+            'execute_file': self._cmd_execute_file,
+            'get_scene_info': self._cmd_get_scene_info,
+            'get_model_variables': self._cmd_get_model_variables,
+            'get_model_overview': self._cmd_get_model_overview,
+            'model_info': self._cmd_get_model_overview,
+            'get_object_info': self._cmd_get_object_info,
+            'model_get': self._cmd_get_object_info,
+            'model_add': self._cmd_model_add,
+            'model_set': self._cmd_model_set,
+            'model_delete': self._cmd_model_delete,
+            'model_script': self._cmd_model_script,
+            'get_script': self._cmd_get_script,
+            'set_script': self._cmd_set_script,
+            'get_parameters': self._cmd_get_object_info,
+            'set_parameter': self._cmd_model_set,
+            'get_sweep_info': self._cmd_get_sweep_info,
+            'add_material': self._cmd_add_material,
+            'set_material': self._cmd_set_material,
+            'get_material': self._cmd_get_material,
+            'material_delete': self._cmd_delete_material,
+            'material_exists': self._cmd_material_exists,
+            'sweep_add': self._cmd_sweep_add,
+            'sweep_set': self._cmd_sweep_set,
+            'sweep_delete': self._cmd_sweep_delete,
+            'get_results': self._cmd_get_results,
+            'result_list': self._cmd_result_list,
+            'list_result_fields': self._cmd_list_result_fields,
+            'get_result_data': self._cmd_result_get,
+            'result_get': self._cmd_result_get,
+            'get_result_file': self._cmd_get_result_file,
+            'has_result': self._cmd_has_result,
+            'run': self._cmd_run,
+            'run_sweep': self._cmd_run_sweep,
+            'get_sweep_result': self._cmd_get_sweep_result,
+        }
 
     # ------------------------------------------------------------------
     # Dispatch
@@ -47,18 +89,24 @@ class FdtdBridge(object):
         method = request.get('method', '')
         params = request.get('params', {})
         try:
-            handler = getattr(self, '_cmd_' + method, None)
+            handler = self._method_map.get(method)
             if handler is None:
                 return self._error(req_id, 'Unknown method: ' + method)
             return self._ok(req_id, handler(params))
         except Exception as e:
-            return self._error(req_id, str(e) + '\n' + traceback.format_exc())
+            tb = traceback.format_exc()
+            if tb and tb.strip():
+                msg = tb.strip().split('\n')[-1][:2000]
+            else:
+                msg = str(e)[:2000]
+            return self._error(req_id, msg)
 
     # ------------------------------------------------------------------
     # Lifecycle
     # ------------------------------------------------------------------
 
-    def _cmd_ping(self, p): return 'pong'
+    def _cmd_ping(self, p):
+        return 'pong'
 
     def _cmd_open(self, p):
         self._fsp = lumapi.FDTD(p['path'], hide=True)
@@ -67,18 +115,24 @@ class FdtdBridge(object):
         for k in ['dimension','x span','y span','z span','simulation time',
                   'mesh accuracy','x min bc','x max bc','y min bc','y max bc',
                   'z min bc','z max bc']:
-            try: s[k] = self._fsp.getnamed('FDTD', k)
-            except Exception: s[k] = None
+            try:
+                s[k] = self._fsp.getnamed('FDTD', k)
+            except Exception:
+                s[k] = None
         return {'status':'ok','path':p['path'],'summary':s}
 
     def _cmd_close(self, p):
-        if self._fsp: self._fsp.close()
-        self._fsp = None; self._path = None
+        if self._fsp:
+            self._fsp.close()
+        self._fsp = None
+        self._path = None
         return {'status':'closed'}
 
     def _cmd_save(self, p):
-        if not self._fsp: raise RuntimeError('No open project')
-        self._fsp.save(p['path']); self._path = p['path']
+        if not self._fsp:
+            raise RuntimeError('No open project')
+        self._fsp.save(p['path'])
+        self._path = p['path']
         return {'status':'ok','path':p['path']}
 
     def _cmd_new(self, p):
@@ -90,56 +144,38 @@ class FdtdBridge(object):
             self._fsp.close()
         self._fsp = lumapi.FDTD(hide=True)
         self._path = None
-        appCall(self._fsp, 'addfdtd', [])
+        self._call_lsf('addfdtd')
         cfg = {}
         for k in ['dimension','x span','y span','z span','simulation time','mesh accuracy']:
             v = p.get(k)
             if v is not None:
-                try: self._fsp.setnamed('FDTD', k, v); cfg[k] = v
-                except Exception: pass
+                try:
+                    self._fsp.setnamed('FDTD', k, v)
+                    cfg[k] = v
+                except Exception:
+                    pass
         return {'status':'ok','config':cfg}
 
     # ------------------------------------------------------------------
-    # execute — universal single-line tool
+    # execute — universal single-line tool (rewritten)
     # ------------------------------------------------------------------
 
     def _cmd_execute(self, p):
-        """Execute a single-line Lumerical command or expression.
-
-        Handles:
-          - delete("name")  → select("name"); delete(); (delete takes no args)
-          - ?expr           → eval _br_r=expr; getv; clear (captures return value)
-          - func(args)      → appCall for return value capture
-          - raw command     → eval (no return value)
-        """
-        if not self._fsp: raise RuntimeError('No open project')
+        """Execute LSF code. ?expr captures return value; everything else is transparent eval."""
+        if not self._fsp:
+            raise RuntimeError('No open project')
         code = p['code']
 
-        # ---- Special case: delete("name") → select + delete ----
-        m_del = re.match(r'delete\(\s*"([^"]+)"\s*\)', code)
-        if m_del:
-            obj_name = m_del.group(1)
-            self._fsp.eval('select("' + obj_name + '"); delete();')
-            return {'status': 'ok', 'deleted': obj_name}
-
-        # ---- Guard: reject raw set("script") calls → use set_script tool ----
-        m_bad_set = re.match(
-            r'set\(\s*"(setup script|analysis script|script)"\s*,', code)
-        if m_bad_set:
-            prop = m_bad_set.group(1)
+        # Guard: reject raw set("...script") calls -> use model_script tool
+        if re.match(r'set\(\s*"(setup script|analysis script|script)"\s*,', code):
             return {
                 'status': 'error',
-                'message': (
-                    'Do NOT use execute() to set "' + prop + '". '
-                    'Use the set_script tool instead: '
-                    'set_script(name="<object>", type="setup|analysis", content="...")'
-                )
+                'message': 'Do NOT use execute() to set scripts. Use model_script(action="set", ...) instead.'
             }
 
-        # ---- ?expr query: appCall for functions, getv for bare names ----
+        # ?expr: capture return value
         if code.startswith('?'):
             expr = code[1:].strip()
-            # Function call: route through appCall (reliable)
             m = re.match(r'(\w+)\((.+)\)', expr)
             if m:
                 func_name = m.group(1)
@@ -147,45 +183,31 @@ class FdtdBridge(object):
                 args = []
                 for a in re.findall(r'"([^"]*)"|\'([^\']*)\'|([^,]+)', raw_args):
                     arg = a[0] or a[1] or a[2].strip()
-                    try: arg = float(arg)
-                    except ValueError: pass
+                    try:
+                        arg = float(arg)
+                    except ValueError:
+                        pass
                     args.append(arg)
-                result = appCall(self._fsp, func_name, args)
+                result = self._call_lsf(func_name, *args)
                 return {'status': 'ok', 'result': self._sanitize(result)}
-            # Bare name: getv (workspace variable), fallback to getnamed on ::model
+            # Bare name: getv, fallback to getnamed
             try:
                 result = self._fsp.getv(expr)
             except Exception:
-                result = appCall(self._fsp, 'getnamed', ['::model', expr])
+                result = self._call_lsf('getnamed', '::model', expr)
             return {'status': 'ok', 'result': self._sanitize(result)}
 
-        # ---- func(args) via appCall (return value capture) ----
-        m = re.match(r'(\w+)\((.+)\)', code)
-        if m:
-            func_name = m.group(1)
-            raw_args = m.group(2)
-            args = []
-            for a in re.findall(r'"([^"]*)"|\'([^\']*)\'|([^,]+)', raw_args):
-                arg = a[0] or a[1] or a[2].strip()
-                try: arg = float(arg)
-                except ValueError: pass
-                args.append(arg)
-            try:
-                result = appCall(self._fsp, func_name, args)
-                return {'status': 'ok', 'result': self._sanitize(result)}
-            except Exception:
-                pass
-
-        # ---- Fallback: pure command via eval ----
+        # Transparent eval (NO parsing, NO splitting on semicolons)
         try:
             self._fsp.eval(code)
             return {'status': 'ok'}
         except Exception as e:
-            return {'status': 'error', 'message': str(e)[:500]}
+            raise RuntimeError(str(e)[:500])
 
     def _cmd_execute_file(self, p):
         """Run a .lsf script file."""
-        if not self._fsp: raise RuntimeError('No open project')
+        if not self._fsp:
+            raise RuntimeError('No open project')
         self._fsp.feval(p['path'])
         return {'status': 'ok'}
 
@@ -210,7 +232,7 @@ class FdtdBridge(object):
 
         Shared between _cmd_get_scene_info and _cmd_get_model_overview.
         Always resets to ::model root before navigating to target scope.
-        Uses appCall for getid (avoids eval-assignment + getv pattern).
+        Uses _call_lsf for getid (avoids eval-assignment + getv pattern).
         """
         # Navigate to target scope from root
         self._fsp.eval('groupscope("::model");')
@@ -220,7 +242,7 @@ class FdtdBridge(object):
                 if part:
                     self._fsp.eval('groupscope("' + part + '");')
         self._fsp.eval('selectall();')
-        ids_raw = appCall(self._fsp, 'getid', [])
+        ids_raw = self._call_lsf('getid')
         ids_str = str(ids_raw) if ids_raw else ''
         if not ids_str:
             return
@@ -230,12 +252,12 @@ class FdtdBridge(object):
                 continue
             seen.add(obj_id)
             try:
-                t = appCall(self._fsp, 'getnamed', [obj_id, 'type'])
+                t = self._call_lsf('getnamed', obj_id, 'type')
                 obj = {'name': obj_id, 'type': str(t)}
                 for prop in prop_list:
                     try:
                         obj[prop] = self._sanitize(
-                            appCall(self._fsp, 'getnamed', [obj_id, prop]))
+                            self._call_lsf('getnamed', obj_id, prop))
                     except Exception:
                         pass
                 # enabled_only filter (if enabled property was read)
@@ -255,7 +277,8 @@ class FdtdBridge(object):
                 pass
 
     def _cmd_get_scene_info(self, p):
-        if not self._fsp: raise RuntimeError('No open project')
+        if not self._fsp:
+            raise RuntimeError('No open project')
         enabled_only = bool(p.get('enabled_only', False))
 
         objects = []
@@ -264,8 +287,10 @@ class FdtdBridge(object):
 
         fdtd = {}
         for k in ['dimension','x span','y span','z span','simulation time','mesh accuracy']:
-            try: fdtd[k] = self._fsp.getnamed('FDTD', k)
-            except Exception: pass
+            try:
+                fdtd[k] = self._fsp.getnamed('FDTD', k)
+            except Exception:
+                pass
 
         return {'objects': objects, 'fdtd_summary': fdtd, 'object_count': len(objects)}
 
@@ -273,64 +298,31 @@ class FdtdBridge(object):
     # Model variables (P0-2) + Model overview (P0-1)
     # ------------------------------------------------------------------
 
-    # Known model variable names from user's typical .fsp files.
-    # These are probed in addition to regex-discovered names.
-    _KNOWN_MODEL_VARS = [
-        'LD', 'DBR', 'top_layer', 'au', 'pmma1', 'd',
-        'n_DBR', 't_H', 't_L', 'fff', 'hfa',
-    ]
-
     def _enum_model_variables(self, scope):
-        """Enumerate model/GUI variables in the given scope.
-
-        Uses multiple strategies since no single lumapi call is guaranteed:
-          1. Try lumapi list-variables call (name unverified — try/except)
-          2. Fallback: regex-scan setup+analysis scripts for addvar/adduserprop
-          3. Append known model variable names from _KNOWN_MODEL_VARS
-        Each name is resolved via getnamed (or getvar if getnamed fails).
-        """
+        """Enumerate model/GUI variables by scanning scripts for addvar/adduserprop."""
         names = []
-        # Strategy 1: try lumapi function to list variables (if exists)
-        for cand in ('getvars', 'listvars', 'dumpvars'):
-            try:
-                r = appCall(self._fsp, cand, [])
-                raw = str(r) if r else ''
-                if raw:
-                    parsed = [n.strip() for n in raw.replace('\n', ',').split(',') if n.strip()]
-                    if parsed:
-                        names = parsed
-                        break
-            except Exception:
-                pass
+        try:
+            scr = self._cmd_get_script({'name': scope})
+            text = (scr.get('setup_script', '') or '') + '\n' + (scr.get('analysis_script', '') or '')
+            var_names = re.findall(r'addvar\(\s*"(\w+)"', text)
+            prop_names = re.findall(r'adduserprop\(\s*"(\w+)"', text)
+            names = list(set(var_names + prop_names))
+        except Exception:
+            pass
 
-        # Strategy 2: regex scan scripts for addvar / adduserprop
-        if not names:
-            try:
-                scr = self._cmd_get_script({'name': scope})
-                text = (scr.get('setup_script', '') or '') + '\n' + (scr.get('analysis_script', '') or '')
-                var_names = re.findall(r'addvar\(\s*"(\w+)"', text)
-                prop_names = re.findall(r'adduserprop\(\s*"(\w+)"', text)
-                names = list(set(var_names + prop_names))
-            except Exception:
-                pass
-
-        # Strategy 3: always probe known names
-        for kn in self._KNOWN_MODEL_VARS:
-            if kn not in names:
-                names.append(kn)
-
-        # Resolve values via getnamed (getvar as fallback)
+        # Resolve values via getnamed (getv as fallback)
         out = {}
         for vn in names:
             if not vn:
                 continue
             val = None
-            for fn in ('getnamed', 'getvar'):
+            try:
+                val = self._call_lsf('getnamed', scope, vn)
+                val = self._sanitize(val)
+            except Exception:
                 try:
-                    val = appCall(self._fsp, fn, [scope, vn])
+                    val = self._fsp.getv(vn)
                     val = self._sanitize(val)
-                    if val is not None:
-                        break
                 except Exception:
                     pass
             if val is not None:
@@ -370,8 +362,7 @@ class FdtdBridge(object):
         # 3) Materials — list known materials via probing
         materials = []
         try:
-            # getmaterial with no specific name returns a list in some versions
-            raw = appCall(self._fsp, 'getmaterial', [])
+            raw = self._call_lsf('getmaterial')
             if raw:
                 raw_str = str(raw)
                 for m in raw_str.replace('\n', ',').split(','):
@@ -400,7 +391,7 @@ class FdtdBridge(object):
         }
 
     # ------------------------------------------------------------------
-    # Single object info (P0-3)
+    # Single object info (P0-3) — enhanced for model_get
     # ------------------------------------------------------------------
 
     def _classify_source(self, t):
@@ -421,13 +412,15 @@ class FdtdBridge(object):
         return None
 
     def _cmd_get_object_info(self, p):
-        """Get full properties of ONE named object with type discriminator."""
+        """Get full properties of ONE named object with type discriminator.
+        For groups and ::model, also returns scripts and variables.
+        """
         if not self._fsp:
             raise RuntimeError('No open project')
-        name = p['name']
+        name = self._resolve_name(p['name'])
         out = {'name': name}
         try:
-            t = appCall(self._fsp, 'getnamed', [name, 'type'])
+            t = self._call_lsf('getnamed', name, 'type')
             t_str = str(t)
             out['type'] = t_str
             sk = self._classify_source(t_str)
@@ -438,13 +431,195 @@ class FdtdBridge(object):
         for prop in self._SCENE_PROPS:
             try:
                 out[prop] = self._sanitize(
-                    appCall(self._fsp, 'getnamed', [name, prop]))
+                    self._call_lsf('getnamed', name, prop))
             except Exception:
                 pass
+        # For groups and ::model, also include scripts and variables
+        t_str = out.get('type', str(t)) if 'type' in out else ''
+        if name == '::model' or t_str in ('Analysis Group', 'Structure Group'):
+            try:
+                scripts = self._cmd_get_script({'name': name})
+                out['scripts'] = scripts
+            except Exception:
+                pass
+            if name == '::model':
+                try:
+                    variables = self._enum_model_variables('::model')
+                    if variables:
+                        out['variables'] = variables
+                except Exception:
+                    pass
         return out
 
+    # ------------------------------------------------------------------
+    # Model add / delete / set
+    # ------------------------------------------------------------------
+
+    def _cmd_model_add(self, p):
+        """Add any object type to the model tree."""
+        if not self._fsp:
+            raise RuntimeError('No open project')
+        obj_type = p['type']
+        name = p.get('name', None)
+        properties = p.get('properties', {})
+        scope = p.get('scope', '::model')
+
+        # Map type string to Lumerical add* function
+        TYPE_MAP = {
+            'rectangle': 'addrect', 'circle': 'addcircle', 'ring': 'addring',
+            'polygon': 'addpoly', 'sphere': 'addsphere', 'pyramid': 'addpyramid',
+            'triangle': 'addtriangle', 'waveguide': 'addwaveguide',
+            'fdtd': 'addfdtd', 'mesh': 'addmesh',
+            'dipole': 'adddipole', 'tfsf': 'addtfsf', 'plane': 'addplane',
+            'gaussian': 'addgaussian', 'mode_source': 'addmode',
+            'power_monitor': 'addpower', 'dft_monitor': 'adddftmonitor',
+            'index_monitor': 'addindex', 'field_monitor': 'addfield',
+            'movie_monitor': 'addmovie',
+            'structure_group': 'addstructuregroup',
+            'analysis_group': 'addanalysisgroup',
+        }
+        func = TYPE_MAP.get(obj_type)
+        if not func:
+            raise RuntimeError('Unknown object type: ' + obj_type +
+                               '. Use one of: ' + ', '.join(sorted(TYPE_MAP.keys())))
+
+        # Navigate scope
+        if scope != '::model':
+            self._fsp.eval('groupscope("' + scope + '");')
+
+        # Create object (Lumerical add* commands auto-select after creation, no name arg)
+        self._call_lsf(func)
+        # Get auto-generated name from the now-selected object
+        try:
+            created_name = str(self._call_lsf('get', 'name'))
+        except Exception:
+            created_name = obj_type
+
+        # Rename if user specified a name
+        if name and created_name != name:
+            self._call_lsf('set', 'name', name)
+            created_name = name
+
+        # Set initial properties
+        if properties:
+            for prop, val in properties.items():
+                try:
+                    self._call_lsf('setnamed', created_name, prop, val)
+                except Exception:
+                    pass
+
+        # Return to root
+        if scope != '::model':
+            self._fsp.eval('groupscope("::model");')
+
+        return {'status': 'ok', 'name': created_name, 'type': obj_type}
+
+    def _cmd_model_delete(self, p):
+        """Delete an object by name."""
+        if not self._fsp:
+            raise RuntimeError('No open project')
+        name = self._resolve_name(p['name'])
+        self._fsp.eval('select("' + name + '"); delete();')
+        return {'status': 'ok', 'deleted': name}
+
+    def _cmd_model_set(self, p):
+        """Set a property/parameter on an object, auto-handling different object types.
+
+        Args:
+            name: target object name (default '::model')
+            property: property/parameter name (single)
+            value: new value (single)
+            properties: dict of property->value pairs (batch)
+        Supports old set_parameter convention (object + name) as well.
+        """
+        if not self._fsp:
+            raise RuntimeError('No open project')
+        # Support batch mode via 'properties' dict
+        if 'properties' in p:
+            obj = self._resolve_name(p.get('name', '::model'))
+            props = p['properties']
+            set_count = 0
+            for prop, value in props.items():
+                try:
+                    if obj == '::model':
+                        try:
+                            self._call_lsf('setnamed', obj, prop, value)
+                        except Exception:
+                            try:
+                                self._call_lsf('addvar', obj, prop, value)
+                            except Exception:
+                                self._call_lsf('setvar', obj, prop, value)
+                    else:
+                        try:
+                            obj_type = str(self._call_lsf('getnamed', obj, 'type'))
+                            if 'Analysis' in obj_type:
+                                try:
+                                    self._call_lsf('setnamed', obj, prop, value)
+                                except Exception:
+                                    self._call_lsf('addanalysisprop', obj, prop)
+                                    self._call_lsf('setnamed', obj, prop, value)
+                            elif 'Structure' in obj_type:
+                                try:
+                                    self._call_lsf('setnamed', obj, prop, value)
+                                except Exception:
+                                    self._call_lsf('adduserprop', obj, prop)
+                                    self._call_lsf('setnamed', obj, prop, value)
+                            else:
+                                self._call_lsf('setnamed', obj, prop, value)
+                        except Exception:
+                            self._call_lsf('setnamed', obj, prop, value)
+                    set_count += 1
+                except Exception:
+                    pass
+            return {'status': 'ok', 'object': obj, 'properties_set': set_count}
+        # Support both new API (name=object, property=prop) and old API (name=prop, object=target)
+        if 'object' in p:
+            obj = p['object']
+            prop = p['name']
+        else:
+            obj = p.get('name', '::model')
+            prop = p.get('property', p.get('name'))
+        value = p['value']
+
+        # Handle different object types
+        if obj == '::model':
+            # Try setnamed first, fall back to addvar/setvar
+            try:
+                self._call_lsf('setnamed', obj, prop, value)
+            except Exception:
+                try:
+                    self._call_lsf('addvar', obj, prop, value)
+                except Exception:
+                    self._call_lsf('setvar', obj, prop, value)
+        else:
+            try:
+                obj_type = str(self._call_lsf('getnamed', obj, 'type'))
+                if 'Analysis' in obj_type:
+                    try:
+                        self._call_lsf('setnamed', obj, prop, value)
+                    except Exception:
+                        self._call_lsf('addanalysisprop', obj, prop)
+                        self._call_lsf('setnamed', obj, prop, value)
+                elif 'Structure' in obj_type:
+                    try:
+                        self._call_lsf('setnamed', obj, prop, value)
+                    except Exception:
+                        self._call_lsf('adduserprop', obj, prop)
+                        self._call_lsf('setnamed', obj, prop, value)
+                else:
+                    self._call_lsf('setnamed', obj, prop, value)
+            except Exception:
+                self._call_lsf('setnamed', obj, prop, value)
+
+        return {'status': 'ok', 'object': obj, 'property': prop, 'value': value}
+
+    # ------------------------------------------------------------------
+    # Script editing
+    # ------------------------------------------------------------------
+
     def _cmd_get_script(self, p):
-        if not self._fsp: raise RuntimeError('No open project')
+        if not self._fsp:
+            raise RuntimeError('No open project')
         name = p.get('name', '::model')
         result = {}
         self._fsp.select(name)
@@ -454,7 +629,7 @@ class FdtdBridge(object):
         if name == '::model':
             props = [('setup script','setup'), ('analysis script','analysis')]
         else:
-            obj_type = str(appCall(self._fsp, 'get', ['type']))
+            obj_type = str(self._call_lsf('get', 'type'))
             if obj_type == 'Analysis Group':
                 props = [('setup script','setup'), ('analysis script','analysis')]
             elif obj_type == 'Structure Group':
@@ -468,8 +643,10 @@ class FdtdBridge(object):
                 # Write to temp file from Lumerical side to avoid C-layer encoding issues.
                 # write() appends to existing files — remove first to avoid stale accumulation.
                 tmp_path = self._tmp_dir + '/_br_' + suffix + '.txt'
-                try: os.remove(tmp_path)
-                except OSError: pass
+                try:
+                    os.remove(tmp_path)
+                except OSError:
+                    pass
                 self._fsp.eval(
                     'write("' + tmp_path.replace('\\','\\\\') + '",'
                     'get("' + stype + '"));'
@@ -492,80 +669,44 @@ class FdtdBridge(object):
                 result[key+'_error'] = str(e)[:200]
         return result
 
-    # ------------------------------------------------------------------
-    # Parameters
-    # ------------------------------------------------------------------
+    def _cmd_set_script(self, p):
+        """Set setup/analysis script on an object. Supports multi-line content.
 
-    def _cmd_get_parameters(self, p):
-        """Get parameters from model, analysis groups, and structure groups.
-
-        If 'object' is specified, only query that object.
-        Otherwise, scan ::model + all analysis/structure groups found in scene.
-        User properties (adduserprop) are discovered from setup scripts.
+        ::model and Analysis Group use 'setup script' / 'analysis script'.
+        Structure Group uses a single 'script' property.
         """
-        if not self._fsp: raise RuntimeError('No open project')
-        target = p.get('object', None)
-        all_params = {}
+        if not self._fsp:
+            raise RuntimeError('No open project')
+        name = p.get('name', '::model')
+        stype = p['type']  # 'setup' or 'analysis'
+        content = p['content']
 
-        objects_to_scan = []
-        if target:
-            objects_to_scan = [target]
+        self._fsp.select(name)
+        if name == '::model':
+            script_prop = stype + ' script'
         else:
-            objects_to_scan = ['::model']
-            try:
-                scene = self._cmd_get_scene_info({})
-                for obj in scene.get('objects', []):
-                    t = obj.get('type', '')
-                    if t in ('Analysis Group', 'Structure Group'):
-                        objects_to_scan.append(obj['name'])
-            except Exception:
-                pass
+            obj_type = str(self._call_lsf('get', 'type'))
+            if obj_type == 'Analysis Group':
+                script_prop = stype + ' script'
+            else:
+                script_prop = 'script'
 
-        for obj_name in objects_to_scan:
-            obj_params = {}
-            # 1. Probe common parameter names
-            for pname in ['gap', 'd', 'LR', 'theta', 'phi', 'fff', 'hfa',
-                          'swp_wv_flag', 'wave_start', 'wave_stop', 'swp_wv',
-                          'x_span', 'y_span', 'z_span', 'NA',
-                          'x span', 'y span', 'z span']:
-                try:
-                    val = appCall(self._fsp, 'getnamed', [obj_name, pname])
-                    obj_params[pname] = self._sanitize(val)
-                except Exception:
-                    pass
-            # 2. Discover user properties from setup script
-            try:
-                scr = self._cmd_get_script({'name': obj_name})
-                script_text = scr.get('script', '') or scr.get('setup_script', '') or ''
-                user_props = re.findall(r'adduserprop\("(\w+)"', script_text)
-                for up in user_props:
-                    if up not in obj_params:
-                        try:
-                            val = appCall(self._fsp, 'getnamed', [obj_name, up])
-                            obj_params[up] = self._sanitize(val)
-                        except Exception:
-                            pass
-            except Exception:
-                pass
-            if obj_params:
-                all_params[obj_name] = obj_params
+        self._call_lsf('set', script_prop, content)
+        return {'status': 'ok', 'object': name, 'script_type': script_prop}
 
-        return {'parameters': all_params}
+    def _cmd_model_script(self, p):
+        """Unified script access. Action: 'get' (default) or 'set'.
 
-    def _cmd_set_parameter(self, p):
-        """Set a parameter value on an object.
-
-        Args:
-            name: parameter name
-            value: new value
-            object: target object name (default '::model' for model-level params)
+        For 'get': returns scripts for the named object.
+        For 'set': requires 'type' ('setup'/'analysis') and 'content'.
         """
-        if not self._fsp: raise RuntimeError('No open project')
-        param_name = p['name']
-        value = p['value']
-        obj = p.get('object', '::model')
-        appCall(self._fsp, 'setnamed', [obj, param_name, value])
-        return {'status': 'ok', 'object': obj, 'name': param_name, 'value': value}
+        action = p.get('action', 'get')
+        if action == 'get':
+            return self._cmd_get_script(p)
+        elif action == 'set':
+            return self._cmd_set_script(p)
+        else:
+            raise RuntimeError('Unknown action: "' + action + '". Use "get" or "set".')
 
     # ------------------------------------------------------------------
     # Sweep info
@@ -573,11 +714,12 @@ class FdtdBridge(object):
 
     def _cmd_get_sweep_info(self, p):
         """Get sweep configuration."""
-        if not self._fsp: raise RuntimeError('No open project')
+        if not self._fsp:
+            raise RuntimeError('No open project')
         name = p['name']
         info = {'name': name}
         try:
-            result = appCall(self._fsp, 'getsweepresult', [name])
+            result = self._call_lsf('getsweepresult', name)
             info['has_results'] = True
             info['result_sample'] = str(result)[:500] if result else 'empty'
         except Exception as e:
@@ -592,6 +734,51 @@ class FdtdBridge(object):
         return info
 
     # ------------------------------------------------------------------
+    # Sweep management (new)
+    # ------------------------------------------------------------------
+
+    def _cmd_sweep_add(self, p):
+        """Add a new sweep with optional parameters and results."""
+        if not self._fsp:
+            raise RuntimeError('No open project')
+        sweep_type = p.get('type', 0)
+        name = p.get('name', 'sweep')
+        parameters = p.get('parameters', [])
+        results = p.get('results', [])
+
+        # Create sweep
+        self._call_lsf('addsweep', sweep_type)
+        self._call_lsf('setsweep', 'sweep', 'name', name)
+
+        # Configure parameters
+        for param in parameters:
+            self._call_lsf('addsweepparameter', name, param)
+
+        # Configure results
+        self._call_lsf('insertsweep', name)
+        for result in results:
+            self._call_lsf('addsweepresult', name, result)
+
+        return {'status': 'ok', 'name': name, 'type': sweep_type,
+                'parameter_count': len(parameters), 'result_count': len(results)}
+
+    def _cmd_sweep_set(self, p):
+        """Set sweep properties."""
+        if not self._fsp:
+            raise RuntimeError('No open project')
+        name = p['name']
+        for prop, val in p.get('properties', {}).items():
+            self._call_lsf('setsweep', name, prop, val)
+        return {'status': 'ok', 'name': name}
+
+    def _cmd_sweep_delete(self, p):
+        """Delete a sweep by name."""
+        if not self._fsp:
+            raise RuntimeError('No open project')
+        self._call_lsf('deletesweep', p['name'])
+        return {'status': 'ok', 'deleted': p['name']}
+
+    # ------------------------------------------------------------------
     # Materials
     # ------------------------------------------------------------------
 
@@ -602,9 +789,10 @@ class FdtdBridge(object):
             type: material model type, e.g. 'Sampled 3D data', 'Dielectric', 'Drude'
         Returns the auto-generated material name.
         """
-        if not self._fsp: raise RuntimeError('No open project')
+        if not self._fsp:
+            raise RuntimeError('No open project')
         mat_type = p.get('type', 'Sampled 3D data')
-        name = appCall(self._fsp, 'addmaterial', [mat_type])
+        name = self._call_lsf('addmaterial', mat_type)
         return {'status': 'ok', 'name': str(name), 'type': mat_type}
 
     def _cmd_set_material(self, p):
@@ -615,11 +803,12 @@ class FdtdBridge(object):
             property: property name, e.g. 'Refractive Index', 'nk data', 'mesh order'
             value: property value (number, string, or array for tabulated nk data)
         """
-        if not self._fsp: raise RuntimeError('No open project')
+        if not self._fsp:
+            raise RuntimeError('No open project')
         name = p['name']
         prop = p['property']
-        value = self._to_lum_array(p['value'])
-        appCall(self._fsp, 'setmaterial', [name, prop, value])
+        value = p['value']
+        self._call_lsf('setmaterial', name, prop, value)
         return {'status': 'ok', 'name': name, 'property': prop}
 
     def _cmd_get_material(self, p):
@@ -629,42 +818,29 @@ class FdtdBridge(object):
             name: material name
             property: optional property name; if omitted, lists all property names
         """
-        if not self._fsp: raise RuntimeError('No open project')
+        if not self._fsp:
+            raise RuntimeError('No open project')
         name = p['name']
         prop = p.get('property', None)
         if prop:
-            result = appCall(self._fsp, 'getmaterial', [name, prop])
+            result = self._call_lsf('getmaterial', name, prop)
         else:
-            result = appCall(self._fsp, 'getmaterial', [name])
+            result = self._call_lsf('getmaterial', name)
         return self._sanitize(result)
 
-    # ------------------------------------------------------------------
-    # Script editing
-    # ------------------------------------------------------------------
+    def _cmd_delete_material(self, p):
+        """Delete a material by name."""
+        if not self._fsp:
+            raise RuntimeError('No open project')
+        self._call_lsf('deletematerial', p['name'])
+        return {'status': 'ok', 'deleted': p['name']}
 
-    def _cmd_set_script(self, p):
-        """Set setup/analysis script on an object. Supports multi-line content.
-
-        ::model and Analysis Group use 'setup script' / 'analysis script'.
-        Structure Group uses a single 'script' property.
-        """
-        if not self._fsp: raise RuntimeError('No open project')
-        name = p.get('name', '::model')
-        stype = p['type']  # 'setup' or 'analysis'
-        content = p['content']
-
-        self._fsp.select(name)
-        if name == '::model':
-            script_prop = stype + ' script'
-        else:
-            obj_type = str(appCall(self._fsp, 'get', ['type']))
-            if obj_type == 'Analysis Group':
-                script_prop = stype + ' script'
-            else:
-                script_prop = 'script'
-
-        appCall(self._fsp, 'set', [script_prop, content])
-        return {'status': 'ok', 'object': name, 'script_type': script_prop}
+    def _cmd_material_exists(self, p):
+        """Check if a material exists."""
+        if not self._fsp:
+            raise RuntimeError('No open project')
+        exists = self._call_lsf('materialexists', p['name'])
+        return {'name': p['name'], 'exists': bool(exists)}
 
     # ------------------------------------------------------------------
     # Results
@@ -677,25 +853,73 @@ class FdtdBridge(object):
         'T', 'R', 'P', 'power', 'T_total',
         'index', 'index_x', 'index_y', 'index_z',
         'intensity', 'E', 'H',
+        'Px', 'Py', 'Pz', 'sigma', 'S', 'Sx', 'Sy', 'Sz',
+        'n', 'k', 'epsilon', 'temp', 'heat',
+        'T_forward', 'T_backward', 'R_forward', 'R_backward',
     ]
 
     def _cmd_get_results(self, p):
-        if not self._fsp: raise RuntimeError('No open project')
+        if not self._fsp:
+            raise RuntimeError('No open project')
         name = p.get('name', 'FDTD')
         try:
-            r = appCall(self._fsp, 'getresult', [name])
+            r = self._call_lsf('getresult', name)
             return {'name': name, 'results': str(r).split('\n') if r else []}
         except Exception as e:
             return {'name': name, 'results': [], 'error': str(e)[:200]}
+
+    def _cmd_result_list(self, p):
+        """List result datasets AND probe field names in one call.
+
+        Returns available result datasets for a monitor/object,
+        with field names probed for each dataset.
+        """
+        if not self._fsp:
+            raise RuntimeError('No open project')
+        name = p.get('name', 'FDTD')
+
+        # Get result datasets
+        try:
+            r = self._call_lsf('getresult', name)
+            datasets = str(r).split('\n') if r else []
+        except Exception as e:
+            return {'name': name, 'datasets': [], 'error': str(e)[:200]}
+
+        # Probe fields for each dataset
+        datasets_with_fields = []
+        for dataset in datasets:
+            dataset = dataset.strip()
+            if not dataset:
+                continue
+            try:
+                self._fsp.eval('_br_rl = getresult("' + name + '","' + dataset + '");')
+                fields = []
+                for cf in self._COMMON_RESULT_FIELDS:
+                    try:
+                        v = self._fsp.getv('_br_rl.' + cf)
+                        if v is not None:
+                            fields.append(cf)
+                    except Exception:
+                        pass
+                self._fsp.eval('clear(_br_rl);')
+                datasets_with_fields.append({'data': dataset, 'fields': fields,
+                                             'field_count': len(fields)})
+            except Exception:
+                datasets_with_fields.append({'data': dataset,
+                                             'error': 'could not load'})
+
+        return {'monitor': name, 'datasets': datasets_with_fields,
+                'dataset_count': len(datasets_with_fields)}
 
     def _cmd_list_result_fields(self, p):
         """List field names in a result dataset WITHOUT fetching full data.
 
         Probes common known field names via getv(dataset.field) to discover
         which fields are accessible. Returns just the field names (no data)
-        so LLM can preview monitor structure before calling get_result_data.
+        so LLM can preview monitor structure before calling result_get.
         """
-        if not self._fsp: raise RuntimeError('No open project')
+        if not self._fsp:
+            raise RuntimeError('No open project')
         monitor = p['monitor']
         data = p.get('data', '')
         try:
@@ -719,55 +943,53 @@ class FdtdBridge(object):
             return {'monitor': monitor, 'data': data,
                     'error': str(e)[:300], 'fields': []}
 
-    def _cmd_get_result_data(self, p):
-        if not self._fsp: raise RuntimeError('No open project')
+    def _cmd_result_get(self, p):
+        """Fetch result data for specific fields from a monitor.
+
+        Unlike get_result_data, this requires explicit 'fields' parameter
+        and only returns the requested fields (no auto-probing).
+
+        Args:
+            monitor: monitor name
+            data: optional result data name (e.g. 'T', 'R')
+            fields: list of field names to retrieve (REQUIRED)
+            cap: max elements per field (default 2000)
+        """
+        if not self._fsp:
+            raise RuntimeError('No open project')
         monitor = p['monitor']
         data = p.get('data', '')
         fields = p.get('fields', None)
+        if not fields:
+            raise RuntimeError('fields parameter is required. Use result_list first to discover available fields.')
         cap = int(p.get('cap', 2000))
-        try:
-            if data:
-                self._fsp.eval('_br_d = getresult("' + monitor + '","' + data + '");')
-            else:
-                self._fsp.eval('_br_d = getresult("' + monitor + '");')
 
-            # If no explicit field list, probe common fields
-            if not fields or len(fields) == 0:
-                fields = []
-                for cf in self._COMMON_RESULT_FIELDS:
-                    try:
-                        v = self._fsp.getv('_br_d.' + cf)
-                        if v is not None:
-                            fields.append(cf)
-                    except Exception:
-                        pass
+        # Load result
+        if data:
+            self._fsp.eval('_br_d = getresult("' + monitor + '","' + data + '");')
+        else:
+            self._fsp.eval('_br_d = getresult("' + monitor + '");')
 
-            out = {'monitor': monitor, 'data': data,
-                   'fields_available': fields, 'values': {}}
-            truncated = {}
-            for fld in fields:
-                try:
-                    v = self._fsp.getv('_br_d.' + fld)
-                    if v is None:
-                        continue
-                    sv = self._sanitize(v)
-                    if isinstance(sv, list) and len(sv) > cap:
-                        out['values'][fld] = sv[:cap]
-                        truncated[fld] = len(sv)
-                    else:
-                        out['values'][fld] = sv
-                except Exception:
-                    pass
-            if truncated:
-                out['truncated'] = truncated
-                out['cap'] = cap
-            self._fsp.eval('clear(_br_d);')
-            return out
-        except Exception as e:
-            return {'error': str(e)[:300], 'monitor': monitor, 'data': data}
+        # Extract requested fields only
+        values = {}
+        truncated = {}
+        for field in fields:
+            try:
+                v = self._fsp.getv('_br_d.' + field)
+                sanitized = self._sanitize(v, cap)
+                values[field] = sanitized
+                if isinstance(sanitized, dict) and sanitized.get('truncated'):
+                    truncated[field] = sanitized.get('length')
+            except Exception as e:
+                values[field] = {'error': str(e)[:200]}
+
+        self._fsp.eval('clear(_br_d);')
+        return {'monitor': monitor, 'data': data, 'values': values,
+                'fields_requested': fields, 'truncated': truncated}
 
     def _cmd_get_result_file(self, p):
-        if not self._fsp: raise RuntimeError('No open project')
+        if not self._fsp:
+            raise RuntimeError('No open project')
         monitor, data, out = p['monitor'], p.get('data', ''), p['output']
         try:
             ep = out.replace('\\', '\\\\')
@@ -780,19 +1002,20 @@ class FdtdBridge(object):
 
     def _cmd_has_result(self, p):
         """Check whether a monitor/element has results without throwing."""
-        if not self._fsp: raise RuntimeError('No open project')
+        if not self._fsp:
+            raise RuntimeError('No open project')
         name = p['name']
         # First try direct lumapi call (if it exists)
         for fn in ('haveresult', 'findresult', 'hasresult'):
             try:
-                r = appCall(self._fsp, fn, [name])
+                r = self._call_lsf(fn, name)
                 if r is not None:
                     return {'name': name, 'exists': bool(r), 'check_method': fn}
             except Exception:
                 pass
         # Fallback: try getresult and see if it succeeds
         try:
-            r = appCall(self._fsp, 'getresult', [name])
+            r = self._call_lsf('getresult', name)
             return {'name': name, 'exists': r is not None and str(r).strip() != '',
                     'check_method': 'getresult_attempt'}
         except Exception:
@@ -803,19 +1026,22 @@ class FdtdBridge(object):
     # ------------------------------------------------------------------
 
     def _cmd_run(self, p):
-        if not self._fsp: raise RuntimeError('No open project')
+        if not self._fsp:
+            raise RuntimeError('No open project')
         self._fsp.run()
         return {'status': 'completed'}
 
     def _cmd_run_sweep(self, p):
-        if not self._fsp: raise RuntimeError('No open project')
+        if not self._fsp:
+            raise RuntimeError('No open project')
         self._fsp.runsweep(p['name'])
         return {'status': 'completed'}
 
     def _cmd_get_sweep_result(self, p):
-        if not self._fsp: raise RuntimeError('No open project')
+        if not self._fsp:
+            raise RuntimeError('No open project')
         try:
-            r = appCall(self._fsp, 'getsweepresult', [p['name']])
+            r = self._call_lsf('getsweepresult', p['name'])
             return self._sanitize(r)
         except Exception as e:
             return {'error': str(e)[:300]}
@@ -824,42 +1050,82 @@ class FdtdBridge(object):
     # Helpers
     # ------------------------------------------------------------------
 
-    def _to_lum_array(self, value):
-        """Convert Python numeric lists to numpy ndarray for appCall.
+    def _resolve_name(self, name):
+        """Resolve a possibly-short object name to its full scoped path.
 
-        Lumapi's appCall marshals list -> MATLAB cell array (wrong for
-        setmaterial/setnamed numeric matrix args), but ndarray -> numeric
-        matrix. Only numeric leaf lists are converted; strings, empty lists,
-        and non-numeric lists pass through unchanged.
+        Tries bare name first, then '::model::name' as fallback.
+        Returns the resolved scoped name if found, or the original name.
         """
-        if isinstance(value, list) and len(value) > 0:
-            try:
-                import numpy as np
-                arr = np.array(value)
-                if arr.dtype.kind in ('i', 'f', 'u'):
-                    return arr
-            except Exception:
-                pass
-        return value
+        if '::' in name:
+            return name  # already scoped
+        # Try bare name
+        try:
+            self._call_lsf('getnamed', name, 'type')
+            return name
+        except Exception:
+            pass
+        # Try ::model:: prefix
+        scoped = '::model::' + name
+        try:
+            self._call_lsf('getnamed', scoped, 'type')
+            return scoped
+        except Exception:
+            pass
+        return name  # fallback: return original, let caller handle error
 
-    def _sanitize(self, value):
-        if value is None: return None
-        if isinstance(value, (bool, int, float)):
-            if isinstance(value, float) and value != value: return None
+    def _call_lsf(self, func_name, *args):
+        """Unified Lumerical function call. Auto-converts list->ndarray for correct MATLAB matrix marshaling."""
+        converted = []
+        for a in args:
+            if isinstance(a, list) and len(a) > 0:
+                try:
+                    import numpy as np
+                    arr = np.array(a)
+                    if arr.dtype.kind in ('i', 'f', 'u'):
+                        a = arr
+                except Exception:
+                    pass
+            converted.append(a)
+        return appCall(self._fsp, func_name, converted)
+
+    def _sanitize(self, value, cap=1000):
+        """Sanitize values for JSON serialization, preserving array shape and truncation info."""
+        if value is None:
+            return None
+        if isinstance(value, (bool, int)):
             return value
-        if isinstance(value, str): return value
+        if isinstance(value, float):
+            return None if value != value else value
+        if isinstance(value, str):
+            return value
         if isinstance(value, (list, tuple)):
-            return [self._sanitize(v) for v in value]
+            total = len(value)
+            truncated = total > cap
+            items = [self._sanitize(v, cap) for v in (value[:cap] if truncated else value)]
+            if truncated:
+                return {'data': items, 'length': total, 'truncated': True}
+            return items
         if isinstance(value, dict):
-            return {str(k): self._sanitize(v) for k, v in value.items()}
+            return {str(k): self._sanitize(v, cap) for k, v in value.items()}
         try:
             import numpy as np
             if isinstance(value, np.ndarray):
-                return value.flatten()[:1000].tolist()
-        except ImportError: pass
-        try: return float(value)
-        except (TypeError, ValueError): pass
-        return str(value)[:10000]
+                flat = value.flatten()
+                total = len(flat)
+                truncated = total > cap
+                data = flat[:cap].tolist() if truncated else flat.tolist()
+                result = {'data': data, 'shape': list(value.shape), 'length': total}
+                if truncated:
+                    result['truncated'] = True
+                return result
+        except ImportError:
+            pass
+        try:
+            return float(value)
+        except (TypeError, ValueError):
+            pass
+        s = str(value)
+        return s[:10000] if len(s) > 10000 else s
 
     def _ok(self, rid, result):
         return {'id': rid, 'result': result}
@@ -874,17 +1140,22 @@ def main():
     sys.stdout.flush()
     for line in sys.stdin:
         line = line.strip()
-        if not line: continue
-        try: request = json.loads(line)
+        if not line:
+            continue
+        try:
+            request = json.loads(line)
         except json.JSONDecodeError:
             sys.stdout.write(json.dumps({'error': 'Invalid JSON'}) + '\n')
-            sys.stdout.flush(); continue
+            sys.stdout.flush()
+            continue
         if request.get('method') == 'shutdown':
-            bridge._cmd_close({}); break
+            bridge._cmd_close({})
+            break
         resp = bridge.handle(request)
         sys.stdout.write(json.dumps(resp, default=str) + '\n')
         sys.stdout.flush()
     sys.exit(0)
+
 
 if __name__ == '__main__':
     main()

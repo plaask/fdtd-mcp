@@ -1,10 +1,10 @@
 # -*- coding: utf-8 -*-
 """
-FDTD MCP Server — 21 tools covering full FDTD workflow.
+FDTD MCP Server — 30 tools, 6 modules covering full FDTD workflow.
 
 Architecture:
-  Claude Code --MCP stdio--> server.py (system Python)
-                                | subprocess stdin/stdout
+  AI Assistant --MCP stdio--> server.py (system Python >=3.10)
+                                | subprocess stdin/stdout (line-delimited JSON)
                              bridge.py (Lumerical embed Python 3.6.8)
                                 | lumapi
                              Lumerical FDTD engine
@@ -16,7 +16,7 @@ from mcp.server import Server
 from mcp.server.stdio import stdio_server
 from .discovery import find_lumerical, find_lumerical_python
 
-# ---- Cheatsheet (bundled lumapi ref data, server-side only) ----
+# ---- Bundled lumapi ref data (server-side only) ----
 _CHEATSHEET_PATH = os.path.join(os.path.dirname(__file__), 'cheatsheet', 'lumapi_ref.json')
 _LUMAPI_REF = {}
 _LUMAPI_NAMES = set()
@@ -86,383 +86,451 @@ class BridgeClient(object):
 
 _bridge = BridgeClient()
 
-# ---- 21 tools ----
+# ---- 30 tools / 6 modules ----
 # Each description embeds correct invocation patterns and common pitfalls.
-# Claude reads these as its only guide — make every word count.
 
 TOOLS = [
     # ==================================================================
-    # Universal (2)
+    # Module: session (5 tools)
     # ==================================================================
-    types.Tool(name='execute',
+    types.Tool(name='session_open',
         description=(
-            'Execute a single-line Lumerical command or expression.\n'
-            '\n'
-            'PATTERNS (use exactly these forms):\n'
-            '  Create object:  execute("addtfsf()") / execute("addpower()") / execute("addrect()") etc.\n'
-            '     → Then configure with set_parameter.\n'
-            '  Delete object:  execute(\'delete("obj_name")\')  — wraps select+delete internally.\n'
-            '  Query value:    execute("?getnamed(\"::model\", \"gap\")")  — prefix with ? to capture return.\n'
-            '  Set property:   execute(\'set("property", value)\') — for simple properties only.\n'
-            '  Raw script:     execute("code; more_code;") — multi-command single line.\n'
-            '\n'
-            'DO NOT use execute for:\n'
-            '  - Editing scripts → use set_script tool instead.\n'
-            '  - Setting material props → use set_material tool instead.\n'
-            '  - Opening/saving files → use open/save tools instead.'
-        ),
-        inputSchema={'type':'object','properties':{'code':{'type':'string','description':'Single-line Lumerical command or expression'}},'required':['code']}),
-    types.Tool(name='execute_file',
-        description='Run a Lumerical script file (.lsf). Use for multi-line scripts.',
-        inputSchema={'type':'object','properties':{'path':{'type':'string'}},'required':['path']}),
-
-    # ==================================================================
-    # Scene (2)
-    # ==================================================================
-    types.Tool(name='get_scene_info',
-        description=(
-            'Get all objects with full properties + FDTD summary in one call.\n'
-            'Recursively traverses all structure/analysis groups — nested children are included.\n'
-            'Use this as the FIRST tool after opening a project to understand its structure.\n'
-            '\n'
-            'HINT: Pass enabled_only=true to skip disabled objects and reduce output noise.\n'
-            '      Or use get_model_overview() for a lighter single-call alternative\n'
-            '      that also includes model variables and materials.'
-        ),
-        inputSchema={'type':'object','properties':{
-            'enabled_only':{'type':'boolean','description':'Skip disabled objects (default false)'}},
-        }),
-    types.Tool(name='get_script',
-        description=(
-            'Get setup and analysis scripts from an object.\n'
-            '\n'
-            'Script property names depend on object TYPE:\n'
-            '  ::model          → returns "setup_script" + "analysis_script"\n'
-            '  Analysis Group   → returns "setup_script" + "analysis_script"\n'
-            '  Structure Group  → returns "script"\n'
-            '\n'
-            'Examples:\n'
-            '  get_script()                    → root model scripts\n'
-            '  get_script(name="Cnorm")        → analysis group scripts\n'
-            '  get_script(name="my_structure") → structure group script'
-        ),
-        inputSchema={'type':'object','properties':{'name':{'type':'string','description':'Object name, default "::model"'}}}),
-
-    # ==================================================================
-    # Parameters (2)
-    # ==================================================================
-    types.Tool(name='get_parameters',
-        description=(
-            'Get all model and analysis group parameters with values.\n'
-            'Discovers both built-in params AND user-defined properties (adduserprop).\n'
-            '\n'
-            'Examples:\n'
-            '  get_parameters()                → all params from ::model + all groups\n'
-            '  get_parameters(object="Cnorm")  → only Cnorm group params'
-        ),
-        inputSchema={'type':'object','properties':{'object':{'type':'string','description':'Object name (default: scan all)'}}}),
-    types.Tool(name='set_parameter',
-        description=(
-            'Set a parameter value on an object.\n'
-            '\n'
-            'Examples:\n'
-            '  set_parameter(name="gap", value=200e-9)              → model-level param\n'
-            '  set_parameter(name="LR", value=0, object="LR_tfsf")  → analysis group param\n'
-            '\n'
-            'Works on ::model (default), Analysis Groups, and Structure Groups.'
-        ),
-        inputSchema={'type':'object','properties':{'name':{'type':'string'},'value':{'type':'number'},'object':{'type':'string','description':'Target object, default "::model"'}},'required':['name','value']}),
-
-    # ==================================================================
-    # Sweep (1)
-    # ==================================================================
-    types.Tool(name='get_sweep_info',
-        description=(
-            'Get parameter sweep configuration.\n'
-            'Tells you: whether the sweep exists, has results, and result structure.\n'
+            'Open a Lumerical FDTD project file (.fsp).\n'
+            'Always call this first to load an existing project.\n'
             '\n'
             'Example:\n'
-            '  get_sweep_info(name="dpgap") → {exists: true, has_results: false, note: "not yet run"}'
-        ),
-        inputSchema={'type':'object','properties':{'name':{'type':'string','description':'Sweep name, e.g. "dpgap"'}},'required':['name']}),
-
-    # ==================================================================
-    # Script editing (1)
-    # ==================================================================
-    types.Tool(name='set_script',
-        description=(
-            'Set the setup or analysis script of an object. Supports multi-line content.\n'
-            '\n'
-            'Script property names depend on object TYPE:\n'
-            '  ::model          → type="setup" sets "setup script", type="analysis" sets "analysis script"\n'
-            '  Analysis Group   → same as ::model (setup/analysis scripts)\n'
-            '  Structure Group  → type is ignored, sets the single "script" property\n'
-            '\n'
-            'Examples:\n'
-            '  set_script(type="setup", content="...")                → model setup script\n'
-            '  set_script(name="Cnorm", type="analysis", content="…") → analysis group analysis script\n'
-            '  set_script(name="my_struct", content="…")              → structure group script\n'
-            '\n'
-            'IMPORTANT: Always use this tool for scripts. Do NOT use execute(\'set("setup script",…)\').'
-        ),
-        inputSchema={'type':'object','properties':{'name':{'type':'string','description':'Object name, default "::model"'},'type':{'type':'string','description':'"setup" or "analysis"'},'content':{'type':'string','description':'Script text (multi-line supported)'}},'required':['type','content']}),
-
-    # ==================================================================
-    # Materials (3)
-    # ==================================================================
-    types.Tool(name='add_material',
-        description=(
-            'Create a new material from a model type template.\n'
-            'Returns the auto-generated material NAME — save this, you need it for set_material.\n'
-            '\n'
-            'Common types:\n'
-            '  "Sampled 3D data" — tabulated nk data (use for polymers like PNIPAM)\n'
-            '  "Dielectric"      — constant refractive index\n'
-            '  "Drude"           — metal Drude model\n'
-            '\n'
-            'Workflow:\n'
-            '  1. add_material(type="Sampled 3D data")  → returns name like "material_1"\n'
-            '  2. set_material(name="material_1", property="nk data", value=[...])\n'
-            '  3. set_parameter(object="rect", name="material", value="material_1")\n'
-            '\n'
-            'Tip: Built-in database materials like "Au (Gold) - Johnson and Christy" need NO add_material —\n'
-            '     just assign the name string directly via set_parameter.'
-        ),
-        inputSchema={'type':'object','properties':{'type':{'type':'string','description':'Material model type, default "Sampled 3D data"'}},'required':[]}),
-    types.Tool(name='set_material',
-        description=(
-            'Set a material property.\n'
-            '\n'
-            'Common properties (name depends on material type — check with get_material first):\n'
-            '  "Refractive Index"  \u2192 constant n (for Dielectric type)\n'
-            '  "sampled 3d data"   \u2192 Nx2 array [[wl,n],...] with optional k (for Sampled 3D data)\n'
-            '  "mesh order"        \u2192 mesh priority override\n'
-            '  "name"             \u2192 rename the material\n'
-            '\n'
-            'Examples:\n'
-            '  set_material(name="mat1", property="Refractive Index", value=1.5)\n'
-            '  set_material(name="mat1", property="mesh order", value=2)\n'
-            '  set_material(name="mat1", property="sampled 3d data", value=[[300e-9,1.5,0],[800e-9,1.5,0]])\n'
-            '\n'
-            'For large nk datasets, prefer file import:\n'
-            '  execute("importnk(\\"C:/path/to/nk_data.txt\\")")\n'
-            'Tip: Call get_material(name) WITHOUT property first to see all settable property names.'
-        ),
-        inputSchema={'type':'object','properties':{'name':{'type':'string'},'property':{'type':'string','description':'e.g. "Refractive Index", "sampled 3d data", "mesh order", "name"'},'value':{'description':'Property value: number, string, or numeric array'}},'required':['name','property','value']}),
-    types.Tool(name='get_material',
-        description=(
-            'Read material properties.\n'
-            'If property is omitted, lists all available property names for the material.\n'
-            'If property is given, returns that property value.'
-        ),
-        inputSchema={'type':'object','properties':{'name':{'type':'string'},'property':{'type':'string','description':'Optional property name to read'}},'required':['name']}),
-
-    # ==================================================================
-    # Results (3)
-    # ==================================================================
-    types.Tool(name='get_results',
-        description=(
-            'List available result names from a monitor or "FDTD".\n'
-            'Use this to discover what datasets exist before calling get_result_data.\n'
-            '\n'
-            'Examples:\n'
-            '  get_results()              → lists FDTD-level results\n'
-            '  get_results(name="DFT")    → lists DFT monitor results'
-        ),
-        inputSchema={'type':'object','properties':{'name':{'type':'string','description':'Monitor name, default "FDTD"'}}}),
-    types.Tool(name='get_result_data',
-        description=(
-            'Get full result dataset from a monitor or "FDTD".\n'
-            'Returns {fields_available: [...], values: {field: array}} — NOT just f/lambda.\n'
-            'Fields include: Ex, Ey, Ez, Hx, Hy, Hz, x, y, z, T, R, P, power, f, lambda, ...\n'
-            '\n'
-            'Use fields=["Ex","T"] to limit expensive data transfer.\n'
-            'Arrays are capped per-field at cap (default 2000) — use get_result_file for full export.\n'
-            '\n'
-            'BEST PRACTICE: Call list_result_fields(monitor, data) FIRST to discover\n'
-            'available field names without transferring data. Then call get_result_data\n'
-            'with only the fields you need.\n'
-            '\n'
-            'Examples:\n'
-            '  get_result_data(monitor="DFT", data="E")       → all available fields\n'
-            '  get_result_data(monitor="::model", data="g_lum") → dataset fields\n'
-            '  get_result_data(monitor="DFT", data="T", fields=["T","f","lambda"])'
+            '  session_open(path="C:/projects/my_sim.fsp")'
         ),
         inputSchema={'type':'object','properties':{
-            'monitor':{'type':'string'},'data':{'type':'string'},
-            'fields':{'type':'array','items':{'type':'string'},'description':'Optional explicit field list to reduce data transfer'},
-            'cap':{'type':'number','description':'Per-field array cap (default 2000)'}},
-            'required':['monitor']}),
-    types.Tool(name='get_result_file',
-        description=(
-            'Extract a result dataset to .mat file for offline analysis.\n'
-            '\n'
-            'Example:\n'
-            '  get_result_file(monitor="DFT", data="E", output="C:/data/fields.mat")'
-        ),
-        inputSchema={'type':'object','properties':{'monitor':{'type':'string'},'data':{'type':'string'},'output':{'type':'string'}},'required':['monitor','data','output']}),
-
-    # ==================================================================
-    # Run (3)
-    # ==================================================================
-    types.Tool(name='run',
-        description='Run the FDTD simulation once. Blocks until completion.',
-        inputSchema={'type':'object','properties':{}}),
-    types.Tool(name='run_sweep',
-        description='Run a parameter sweep by name. Blocks until completion.',
-        inputSchema={'type':'object','properties':{'name':{'type':'string'}},'required':['name']}),
-    types.Tool(name='get_sweep_result',
-        description='Get results from a completed parameter sweep.',
-        inputSchema={'type':'object','properties':{'name':{'type':'string'}},'required':['name']}),
-
-    # ==================================================================
-    # Lifecycle (4)
-    # ==================================================================
-    types.Tool(name='open',
-        description='Open a Lumerical FDTD project file (.fsp). Always call this first.',
-        inputSchema={'type':'object','properties':{'path':{'type':'string'}},'required':['path']}),
-    types.Tool(name='new',
+            'path':{'type':'string','description':'Path to .fsp file'}},
+            'required':['path']}),
+    types.Tool(name='session_new',
         description=(
             'Create a new blank FDTD project (no .fsp file needed).\n'
             'Optionally set FDTD region properties.\n'
             '\n'
             'Example:\n'
-            '  new(dimension="3D", x_span=2e-6, y_span=2e-6, z_span=1e-6, mesh_accuracy=4)'
+            '  session_new(dimension="3D", x_span=2e-6, y_span=2e-6, z_span=1e-6, mesh_accuracy=4)'
         ),
         inputSchema={'type':'object','properties':{
             'dimension':{'type':'string','description':'2D or 3D'},
-            'x span':{'type':'number'},'y span':{'type':'number'},'z span':{'type':'number'},
-            'simulation time':{'type':'number'},'mesh accuracy':{'type':'number'}}}),
-    types.Tool(name='close',
+            'x_span':{'type':'number'},'y_span':{'type':'number'},'z_span':{'type':'number'},
+            'simulation_time':{'type':'number'},'mesh_accuracy':{'type':'number'}}}),
+    types.Tool(name='session_close',
         description='Close the currently open FDTD project.',
         inputSchema={'type':'object','properties':{}}),
-    types.Tool(name='save',
-        description='Save current project to .fsp file.',
-        inputSchema={'type':'object','properties':{'path':{'type':'string'}},'required':['path']}),
+    types.Tool(name='session_save',
+        description=(
+            'Save the current project.\n'
+            'If path is omitted, overwrites the current file (if previously saved).\n'
+            '\n'
+            'Examples:\n'
+            '  session_save()                                  -> overwrite current file\n'
+            '  session_save(path="C:/projects/my_sim.fsp")    -> save as new path'
+        ),
+        inputSchema={'type':'object','properties':{
+            'path':{'type':'string','description':'Output .fsp path (optional, omit to overwrite current)'}}}),
+    types.Tool(name='session_save_as',
+        description=(
+            'Save the current project with a new path.\n'
+            '\n'
+            'Example:\n'
+            '  session_save_as(path="C:/projects/my_sim_v2.fsp")'
+        ),
+        inputSchema={'type':'object','properties':{
+            'path':{'type':'string','description':'Output .fsp path'}},
+            'required':['path']}),
 
     # ==================================================================
-    # Anti-hallucination / Infra — server-side, NO bridge round-trip (1)
+    # Module: model (6 tools)
     # ==================================================================
-    types.Tool(name='get_lumapi_ref',
+    types.Tool(name='model_info',
+        description=(
+            'ONE-CALL model self-introspection: object tree (recursive), materials list, '
+            'model variables, FDTD summary, result names.\n'
+            'Merges scene info + model overview + variables into a single result.\n'
+            '\n'
+            'Call this FIRST after opening/creating a project, and BEFORE you:\n'
+            '  - Make assumptions about object types\n'
+            '  - Use variable names not yet verified\n'
+            '  - Assign materials to objects\n'
+            '\n'
+            'Disabled objects FILTERED OUT by default (enabled_only=true).\n'
+            'Set include_full=true to get full per-object properties (slower, larger response).'
+        ),
+        inputSchema={'type':'object','properties':{
+            'enabled_only':{'type':'boolean','description':'Skip disabled objects (default true)'},
+            'include_full':{'type':'boolean','description':'Also return full per-object props (default false)'}}}),
+    types.Tool(name='model_add',
+        description=(
+            'Add ANY object to the model tree.\n'
+            '\n'
+            'Supported types:\n'
+            '  rectangle, circle, ring, polygon, sphere, pyramid, triangle, waveguide\n'
+            '  fdtd, mesh\n'
+            '  dipole, tfsf, plane, gaussian, mode_source\n'
+            '  power_monitor, dft_monitor, index_monitor, field_monitor, movie_monitor\n'
+            '  structure_group, analysis_group\n'
+            '\n'
+            'Examples:\n'
+            '  model_add(type="rectangle", name="my_rect",\n'
+            '    properties={"x span": 1e-6, "y span": 2e-6})\n'
+            '  model_add(type="dipole", properties={"x": 0, "y": 0, "z": 0})\n'
+            '\n'
+            'If name is omitted, Lumerical auto-generates one.\n'
+            'Use scope="::model" (default) to add at root level.'
+        ),
+        inputSchema={'type':'object','properties':{
+            'type':{'type':'string','description':'Object type to create',
+                'enum':['rectangle','circle','ring','polygon','sphere','pyramid','triangle',
+                        'waveguide','fdtd','mesh','dipole','tfsf','plane','gaussian',
+                        'mode_source','power_monitor','dft_monitor','index_monitor',
+                        'field_monitor','movie_monitor','structure_group','analysis_group']},
+            'name':{'type':'string','description':'Optional name (auto-generated if omitted)'},
+            'properties':{'type':'object','description':'Optional property dict to set after creation'},
+            'scope':{'type':'string','description':'Parent scope, default "::model"'}},
+            'required':['type']}),
+    types.Tool(name='model_get',
+        description=(
+            'Get full info for ONE named object: all properties, scripts (if group/::model),\n'
+            'variables (if group/::model), children (if group).\n'
+            '\n'
+            'Example:\n'
+            '  model_get(name="source_1")\n'
+            '    -> {type: "Dipole", amplitude: 1.0, ...}'
+        ),
+        inputSchema={'type':'object','properties':{
+            'name':{'type':'string','description':'Object name (required)'}},
+            'required':['name']}),
+    types.Tool(name='model_set',
+        description=(
+            'Set properties/variables on an object.\n'
+            'For "::model": uses addvar/setvar for new properties.\n'
+            'For groups: uses adduserprop/addanalysisprop.\n'
+            'For ordinary objects: uses setnamed directly.\n'
+            '\n'
+            'Examples:\n'
+            '  model_set(name="my_rect", properties={"x span": 2e-6, "y span": 1e-6})\n'
+            '  model_set(name="::model", properties={"gap": 200e-9})'
+        ),
+        inputSchema={'type':'object','properties':{
+            'name':{'type':'string','description':'Object name'},
+            'properties':{'type':'object','description':'Dict of property=value pairs'}},
+            'required':['name','properties']}),
+    types.Tool(name='model_delete',
+        description=(
+            'Delete an object from the model tree by name.\n'
+            '\n'
+            'Example:\n'
+            '  model_delete(name="my_rect")'
+        ),
+        inputSchema={'type':'object','properties':{
+            'name':{'type':'string','description':'Object name to delete'}},
+            'required':['name']}),
+    types.Tool(name='model_script',
+        description=(
+            'Get or set scripts on objects with script properties.\n'
+            '\n'
+            'Actions:\n'
+            '  action="get"  -> return current script text\n'
+            '  action="set"  -> write new script content\n'
+            '\n'
+            'Script property names depend on object TYPE (auto-detected):\n'
+            '  ::model          -> "setup script" / "analysis script"\n'
+            '  Analysis Group   -> "setup script" / "analysis script"\n'
+            '  Structure Group  -> "script"\n'
+            '\n'
+            'Examples:\n'
+            '  model_script(name="::model", action="get")\n'
+            '  model_script(name="Cnorm", action="get")\n'
+            '  model_script(name="Cnorm", action="set", content="...new script...")\n'
+            '  model_script(name="my_struct", action="set", script_type="script", content="...")\n'
+            '\n'
+            'IMPORTANT: Always use this tool for scripts. '
+            'Do NOT use execute(\'set("setup script",...)\').'
+        ),
+        inputSchema={'type':'object','properties':{
+            'name':{'type':'string','description':'Object name, default "::model"'},
+            'action':{'type':'string','description':'"get" or "set"'},
+            'script_type':{'type':'string','description':'"setup", "analysis", or "script" (auto-detected if omitted)'},
+            'content':{'type':'string','description':'Script text (required for action="set")'}},
+            'required':['name','action']}),
+
+    # ==================================================================
+    # Module: material (5 tools)
+    # ==================================================================
+    types.Tool(name='material_add',
+        description=(
+            'Create a new material from a model type template.\n'
+            'Returns the auto-generated material NAME.\n'
+            '\n'
+            'Common types:\n'
+            '  "Sampled 3D data"  -> tabulated nk data (use for polymers like PNIPAM)\n'
+            '  "Dielectric"       -> constant refractive index\n'
+            '  "Drude"            -> metal Drude model\n'
+            '\n'
+            'Workflow:\n'
+            '  1. material_add(type="Sampled 3D data")  -> returns name like "material_1"\n'
+            '  2. material_set(name="material_1", property="sampled 3d data", value=[[...]])\n'
+            '  3. model_set(name="my_rect", properties={"material": "material_1"})\n'
+            '\n'
+            'Tip: Built-in database materials (e.g. "Au (Gold) - Johnson and Christy")\n'
+            'need NO material_add -- just assign the name string via model_set.'
+        ),
+        inputSchema={'type':'object','properties':{
+            'type':{'type':'string','description':'Material model type, default "Sampled 3D data"'}}}),
+    types.Tool(name='material_get',
+        description=(
+            'Read material properties.\n'
+            'If property is omitted, lists all available property names for the material.\n'
+            '\n'
+            'Examples:\n'
+            '  material_get(name="material_1")                   -> list all property names\n'
+            '  material_get(name="material_1", property="sampled 3d data")  -> return data'
+        ),
+        inputSchema={'type':'object','properties':{
+            'name':{'type':'string'},'property':{'type':'string','description':'Optional property name to read'}},
+            'required':['name']}),
+    types.Tool(name='material_set',
+        description=(
+            'Set a material property.\n'
+            '\n'
+            'Correct property names (depends on material type -- check with material_get first):\n'
+            '  "sampled 3d data"  -> Nx2/3 array [[wl,n,ik],...] for Sampled 3D data\n'
+            '  "Refractive Index" -> constant n (for Dielectric type)\n'
+            '  "mesh order"       -> mesh priority override\n'
+            '  "name"            -> rename the material\n'
+            '  "color"           -> RGBA color\n'
+            '\n'
+            'Data format for sampled materials:\n'
+            '  Nx2 array: [[wl1, n1+ik1], [wl2, n2+ik2], ...]\n'
+            '  or [[freq1, eps1], [freq2, eps2], ...]\n'
+            '\n'
+            'Examples:\n'
+            '  material_set(name="mat1", property="Refractive Index", value=1.5)\n'
+            '  material_set(name="mat1", property="mesh order", value=2)\n'
+            '  material_set(name="mat1", property="sampled 3d data",\n'
+            '    value=[[300e-9,1.5,0],[800e-9,1.5,0]])\n'
+            '\n'
+            'For large nk datasets, prefer file import:\n'
+            '  execute(\'importnk("C:/path/to/nk_data.txt")\')\n'
+            'Tip: Call material_get(name) WITHOUT property first to see all settable property names.'
+        ),
+        inputSchema={'type':'object','properties':{
+            'name':{'type':'string'},'property':{'type':'string'},'value':{'description':'Property value: number, string, or numeric array'}},
+            'required':['name','property','value']}),
+    types.Tool(name='material_delete',
+        description=(
+            'Delete a material from the database.\n'
+            '\n'
+            'Example:\n'
+            '  material_delete(name="material_1")'
+        ),
+        inputSchema={'type':'object','properties':{
+            'name':{'type':'string'}}, 'required':['name']}),
+    types.Tool(name='material_exists',
+        description=(
+            'Check if a material exists in the database.\n'
+            '\n'
+            'Example:\n'
+            '  material_exists(name="Au (Gold) - Johnson and Christy") -> {exists: true}'
+        ),
+        inputSchema={'type':'object','properties':{
+            'name':{'type':'string'}}, 'required':['name']}),
+
+    # ==================================================================
+    # Module: sweep (6 tools)
+    # ==================================================================
+    types.Tool(name='sweep_add',
+        description=(
+            'Create and configure a parameter sweep.\n'
+            '\n'
+            'Types: 0=parameter sweep, 1=optimization, 2=monte carlo, 3=s-parameter\n'
+            '\n'
+            'Example:\n'
+            '  sweep_add(name="gap_sweep", type=0,\n'
+            '    parameters=[{"name":"gap","parameter":"::model>gap",\n'
+            '                 "type":"Linear","start":100e-9,"stop":300e-9,"points":5}],\n'
+            '    results=[{"name":"T","result":"DFT>T"}])'
+        ),
+        inputSchema={'type':'object','properties':{
+            'type':{'type':'integer','description':'Sweep type: 0=parameter, 1=optimization, 2=monte carlo, 3=s-parameter (default 0)'},
+            'name':{'type':'string','description':'Sweep name'},
+            'parameters':{'type':'array','items':{'type':'object'},'description':'List of sweep parameter dicts'},
+            'results':{'type':'array','items':{'type':'object'},'description':'List of sweep result dicts'}},
+            'required':['type','name']}),
+    types.Tool(name='sweep_get',
+        description=(
+            'Get parameter sweep configuration.\n'
+            'Tells you: whether the sweep exists, has results, and result structure.\n'
+            '\n'
+            'Example:\n'
+            '  sweep_get(name="gap_sweep") -> {exists: true, has_results: false, note: "not yet run"}'
+        ),
+        inputSchema={'type':'object','properties':{
+            'name':{'type':'string','description':'Sweep name'}},
+            'required':['name']}),
+    types.Tool(name='sweep_set',
+        description=(
+            'Modify sweep properties.\n'
+            '\n'
+            'Example:\n'
+            '  sweep_set(name="gap_sweep", properties={"sweep type": 0})'
+        ),
+        inputSchema={'type':'object','properties':{
+            'name':{'type':'string','description':'Sweep name'},
+            'properties':{'type':'object','description':'Dict of property=value pairs'}},
+            'required':['name','properties']}),
+    types.Tool(name='sweep_delete',
+        description=(
+            'Delete a sweep by name.\n'
+            '\n'
+            'Example:\n'
+            '  sweep_delete(name="gap_sweep")'
+        ),
+        inputSchema={'type':'object','properties':{
+            'name':{'type':'string'}}, 'required':['name']}),
+    types.Tool(name='sweep_run',
+        description=(
+            'Run a parameter sweep by name. Blocks until completion.\n'
+            '\n'
+            'Example:\n'
+            '  sweep_run(name="gap_sweep")'
+        ),
+        inputSchema={'type':'object','properties':{
+            'name':{'type':'string'}}, 'required':['name']}),
+    types.Tool(name='sweep_result',
+        description=(
+            'Get results from a completed parameter sweep.\n'
+            '\n'
+            'Examples:\n'
+            '  sweep_result(name="gap_sweep")                 -> all results\n'
+            '  sweep_result(name="gap_sweep", result="T")    -> specific result'
+        ),
+        inputSchema={'type':'object','properties':{
+            'name':{'type':'string'},'result':{'type':'string','description':'Optional result name'}},
+            'required':['name']}),
+
+    # ==================================================================
+    # Module: result (4 tools)
+    # ==================================================================
+    types.Tool(name='result_list',
+        description=(
+            'List available results/data for a monitor, or list all monitors with results.\n'
+            '\n'
+            'Examples:\n'
+            '  result_list()                          -> list all monitors with results\n'
+            '  result_list(monitor="DFT")             -> list datasets on DFT monitor\n'
+            '  result_list(monitor="DFT", data="E")   -> list field names in E dataset\n'
+            '\n'
+            'Call this BEFORE result_get to discover available field names.'
+        ),
+        inputSchema={'type':'object','properties':{
+            'monitor':{'type':'string','description':'Monitor name (optional)'},
+            'data':{'type':'string','description':'Dataset name, e.g. "E", "T" (optional)'}}}),
+    types.Tool(name='result_get',
+        description=(
+            'Get result data from a monitor. Fields parameter is REQUIRED.\n'
+            'Call result_list FIRST to discover available field names.\n'
+            '\n'
+            'Returns {fields_available: [...], values: {field: array}}.\n'
+            'Common fields: Ex, Ey, Ez, Hx, Hy, Hz, x, y, z, T, R, P, power, f, lambda\n'
+            '\n'
+            'Examples:\n'
+            '  result_get(monitor="DFT", fields=["Ex","Ey","f","lambda"])\n'
+            '  result_get(monitor="::model", data="g_lum", fields=["lambda","T"])\n'
+            '\n'
+            'Arrays are capped per-field at cap (default 2000) -- '
+            'use result_save for full .mat export.'
+        ),
+        inputSchema={'type':'object','properties':{
+            'monitor':{'type':'string'},
+            'data':{'type':'string','description':'Dataset name, e.g. "E", "T"'},
+            'fields':{'type':'array','items':{'type':'string'},
+                'description':'Field names to retrieve (use result_list first)'},
+            'cap':{'type':'number','description':'Per-field array cap (default 2000)'}},
+            'required':['monitor','fields']}),
+    types.Tool(name='result_save',
+        description=(
+            'Save result data to .mat file for offline analysis.\n'
+            '\n'
+            'Examples:\n'
+            '  result_save(monitor="DFT", data="E")\n'
+            '  result_save(monitor="DFT", data="E", output="C:/data/fields.mat")'
+        ),
+        inputSchema={'type':'object','properties':{
+            'monitor':{'type':'string'},'data':{'type':'string'},
+            'output':{'type':'string','description':'Output .mat file path (optional)'}},
+            'required':['monitor','data']}),
+    types.Tool(name='result_has',
+        description=(
+            'Check whether a monitor/element has results WITHOUT throwing an exception.\n'
+            'Returns {exists: true/false}. Call before result_get to avoid errors\n'
+            'when a monitor has no results (e.g. before simulation is run).\n'
+            '\n'
+            'Example:\n'
+            '  result_has(name="DFT") -> {exists: true}'
+        ),
+        inputSchema={'type':'object','properties':{
+            'name':{'type':'string'}}, 'required':['name']}),
+
+    # ==================================================================
+    # Module: engine (4 tools)
+    # ==================================================================
+    types.Tool(name='run',
+        description='Run the FDTD simulation once. Blocks until completion.',
+        inputSchema={'type':'object','properties':{}}),
+    types.Tool(name='execute',
+        description=(
+            'Execute LSF script code directly. Supports full multi-line LSF scripts '
+            'passed to the Lumerical engine via eval().\n'
+            '\n'
+            'PATTERNS:\n'
+            '  Query value:    execute("?getnamed(\\"::model\\", \\"gap\\")")\n'
+            '                    -> prefix with ? to capture return value\n'
+            '  Delete object:  execute(\'select("obj_name"); delete();\')\n'
+            '                    -> NOT delete("name") -- use select+delete form\n'
+            '  Create object:  execute("addrect(); setnamed(\\"rect\\", \\"x span\\", 1e-6)")\n'
+            '  Multi-line:     execute("for i=1:10; ?i; end")\n'
+            '\n'
+            'DO NOT use execute for:\n'
+            '  - Editing scripts       -> use model_script tool instead\n'
+            '  - Setting material props -> use material_set tool instead\n'
+            '  - Opening/saving files  -> use session_open/session_save tools instead\n'
+            '\n'
+            'OK for execute:\n'
+            '  - Material file import:  execute(\'importnk("C:/path/to/file.txt")\')'
+        ),
+        inputSchema={'type':'object','properties':{
+            'code':{'type':'string','description':'LSF script code (multi-line supported)'}},
+            'required':['code']}),
+    types.Tool(name='execute_file',
+        description='Run a Lumerical script file (.lsf).',
+        inputSchema={'type':'object','properties':{
+            'path':{'type':'string'}}, 'required':['path']}),
+    types.Tool(name='reference_lookup',
         description=(
             'Look up VERIFIED Lumerical API signature/parameter ranges BEFORE writing scripts.\n'
             'This is a server-side tool (no bridge call) that reads a curated bundled cheatsheet.\n'
             '\n'
             'Modes:\n'
-            '  get_lumapi_ref(name="getresult")  → full entry: signature, args, pitfalls\n'
-            '  get_lumapi_ref(list_only=true)     → all known function names\n'
-            '  get_lumapi_ref(category="result")  → all entries in one category\n'
+            '  reference_lookup(name="getresult")   -> full entry: signature, args, pitfalls\n'
+            '  reference_lookup(list_only=true)      -> all known function names\n'
+            '  reference_lookup(category="result")   -> all entries in one category\n'
             '\n'
-            'IMPORTANT: Always call list_only=true first before referencing a Lumerical function\n'
-            'to ensure it exists. The cheatsheet covers commonly-used functions only — if a name\n'
-            'is not listed, do NOT guess its signature; ask the user or check Lumerical docs.\n'
-            'Script validation (execute/set_script) will warn you about unknown function names.'
+            'Always call list_only=true first before referencing a Lumerical function\n'
+            'to ensure it exists. Script validation will warn about unrecognized function names.'
         ),
         inputSchema={'type':'object','properties':{
-            'name':{'type':'string','description':'Exact lumapi/LSF function name, e.g. getresult, farfield3d'},
+            'name':{'type':'string','description':'Exact Lumerical API function name, e.g. getresult'},
             'category':{'type':'string','description':'Filter by category: result|source|material|object|analysis|variable|sweep|mesh|monitor|general'},
-            'list_only':{'type':'boolean','description':'If true, return only function names (ignores name/category)'}},
-        },
-    ),
-]
-
-# ---- New anti-hallucination tools (via bridge) ----
-_NEW_TOOLS = [
-    types.Tool(name='get_model_overview',
-        description=(
-            'ONE-CALL self-introspection to stop skipping steps.\n'
-            'Returns ALL information needed for modeling + script writing in ONE dict:\n'
-            '  {objects: [...(name,type,enabled,material)], model_variables: {...}, materials: [...], notes: ["..."]}\n'
-            '\n'
-            'Disabled objects FILTERED OUT by default (enabled_only=true).\n'
-            'Scripts are NOT included — call get_script on demand.\n'
-            '\n'
-            'Call this FIRST after opening a project, and BEFORE you:\n'
-            '  - Make assumptions about object types (dipole vs plane source?)\n'
-            '  - Use variable names in scripts (LD/DBR/top_layer/au values are here)\n'
-            '  - Assign materials to objects (material list is here)\n'
-            '  - Read/edit scripts (scripts pulled separately via get_script)\n'
-            '\n'
-            'NOT a replacement for get_lumapi_ref — consult that BEFORE writing script code.'
-        ),
-        inputSchema={'type':'object','properties':{
-            'enabled_only':{'type':'boolean','description':'Skip disabled objects (default true)'},
-            'include_full':{'type':'boolean','description':'Also return full per-object props (default false)'}},
-        },
-    ),
-    types.Tool(name='get_model_variables',
-        description=(
-            'Read GUI Model Variables table (LD, DBR, top_layer, au, pmma1, d, n_DBR, t_H, t_L, ...).\n'
-            'These DO NOT appear via get_parameters — they live in the Variables table,\n'
-            'separate from the ::model property list.\n'
-            '\n'
-            'Call this whenever a setup script references a variable whose value is unknown,\n'
-            'or after opening a project to understand current geometry/material configuration.\n'
-            'Example variables this tool finds: LD (chirality), DBR (center wavelength),\n'
-            'top_layer (spacer thickness), au (gold layer thickness).'
-        ),
-        inputSchema={'type':'object','properties':{
-            'name':{'type':'string','description':'Scope (default "::model")'}},
-        },
-    ),
-    types.Tool(name='get_object_info',
-        description=(
-            'Get full properties of ONE named object with an explicit TYPE discriminator.\n'
-            'Use this instead of grep-ing the giant get_scene_info JSON.\n'
-            '\n'
-            'Example:\n'
-            '  get_object_info(name="source_1")\n'
-            '    → {type: "Dipole Source", source_kind: "dipole", amplitude: 1.0, ...}\n'
-            '\n'
-            'The source_kind field explicitly tells you what KIND of source (dipole/plane/tfsf/gaussian)\n'
-            'so you never confuse a Dipole for a PlaneSource. Always call this before asserting\n'
-            'an object\'s type or properties.'
-        ),
-        inputSchema={'type':'object','properties':{
-            'name':{'type':'string','description':'Object name (required)'}},
-            'required':['name'],
-        },
-    ),
-    types.Tool(name='list_result_fields',
-        description=(
-            'List available field names in a result dataset BEFORE fetching data.\n'
-            'Cheaper than get_result_data — no data transfer, just field names.\n'
-            'Call this FIRST to discover what fields (Ex, Ey, T, lambda, x, etc.) exist\n'
-            'for a monitor before requesting them with get_result_data.\n'
-            '\n'
-            'Examples:\n'
-            '  list_result_fields(monitor="DFT", data="E") → ["Ex","Ey","Ez","f","lambda","x","y","z"]\n'
-            '  list_result_fields(monitor="FDTD") → ["source power","lambda","f"]'
-        ),
-        inputSchema={'type':'object','properties':{
-            'monitor':{'type':'string','description':'Monitor name (required)'},
-            'data':{'type':'string','description':'Dataset name, e.g. "E", "T", "P". If omitted, no second arg passed to getresult.'}},
-            'required':['monitor'],
-        },
-    ),
-    types.Tool(name='has_result',
-        description=(
-            'Check whether a monitor has results WITHOUT throwing an exception.\n'
-            'Returns {exists: true/false}. Call before get_result_data to avoid errors\n'
-            'when a monitor has no results (e.g. before simulation is run).\n'
-            '\n'
-            'Examples:\n'
-            '  has_result(name="DFT") → {exists: true}'
-        ),
-        inputSchema={'type':'object','properties':{
-            'name':{'type':'string','description':'Monitor or element name (required)'}},
-            'required':['name'],
-        },
-    ),
+            'list_only':{'type':'boolean','description':'If true, return only function names (ignores name/category)'}}}),
 ]
 
 app = Server('fdtd-mcp')
 
-# Combine original tools with new tools for the listing
-_ALL_TOOLS = TOOLS + _NEW_TOOLS
-
 @app.list_tools()
-async def list_tools(): return _ALL_TOOLS
+async def list_tools(): return TOOLS
 
 @app.call_tool()
 async def call_tool(name: str, arguments: dict[str, Any]):
@@ -471,39 +539,53 @@ async def call_tool(name: str, arguments: dict[str, Any]):
     # ----------------------------------------------------------------
     # Server-side tools (NO bridge round-trip)
     # ----------------------------------------------------------------
-    if name == 'get_lumapi_ref':
+    if name == 'reference_lookup':
         return _handle_lumapi_ref(arguments)
 
     # ----------------------------------------------------------------
     # Bridge-dispatched tools
     # ----------------------------------------------------------------
     method_map = {
-        'execute':'execute', 'execute_file':'execute_file',
-        'open':'open', 'new':'new', 'close':'close', 'save':'save',
-        'get_scene_info':'get_scene_info', 'get_script':'get_script',
-        'get_parameters':'get_parameters', 'set_parameter':'set_parameter',
-        'get_sweep_info':'get_sweep_info', 'set_script':'set_script',
-        'add_material':'add_material', 'set_material':'set_material', 'get_material':'get_material',
-        'get_results':'get_results', 'get_result_data':'get_result_data',
-        'get_result_file':'get_result_file',
-        'run':'run', 'run_sweep':'run_sweep', 'get_sweep_result':'get_sweep_result',
-        # New anti-hallucination tools
-        'get_model_overview':'get_model_overview', 'get_model_variables':'get_model_variables',
-        'get_object_info':'get_object_info',
-        'list_result_fields':'list_result_fields', 'has_result':'has_result',
+        # session
+        'session_open': 'open', 'session_new': 'new', 'session_close': 'close',
+        'session_save': 'save', 'session_save_as': 'save_as',
+        # model
+        'model_info': 'model_info', 'model_add': 'model_add',
+        'model_get': 'model_get', 'model_set': 'model_set',
+        'model_delete': 'model_delete', 'model_script': 'model_script',
+        # material
+        'material_add': 'add_material', 'material_get': 'get_material',
+        'material_set': 'set_material', 'material_delete': 'material_delete',
+        'material_exists': 'material_exists',
+        # sweep
+        'sweep_add': 'sweep_add', 'sweep_get': 'sweep_get',
+        'sweep_set': 'sweep_set', 'sweep_delete': 'sweep_delete',
+        'sweep_run': 'sweep_run', 'sweep_result': 'sweep_result',
+        # result
+        'result_list': 'result_list', 'result_get': 'result_get',
+        'result_save': 'result_save', 'result_has': 'result_has',
+        # engine
+        'run': 'run', 'execute': 'execute', 'execute_file': 'execute_file',
     }
     bm = method_map.get(name)
-    if not bm: raise ValueError('Unknown tool: ' + name)
+    if not bm:
+        raise ValueError('Unknown tool: ' + name)
 
     params = dict(arguments) if arguments else {}
 
     # ---- Parameter defaults ----
-    if name == 'set_script':
-        params['type'] = arguments.get('type', 'setup')
-    if name in ('get_result_data', 'list_result_fields'):
+    if name == 'model_script':
+        params['action'] = arguments.get('action', 'get')
+        params['script_type'] = arguments.get('script_type', '')
+    if name == 'sweep_add':
+        params['type'] = arguments.get('type', 0)
+    if name in ('result_get', 'result_list'):
         params['data'] = arguments.get('data', '')
-    if name == 'get_result_file':
+    if name == 'result_save':
         params['output'] = arguments.get('output', '')
+    if name == 'result_get':
+        params['cap'] = arguments.get('cap', 2000)
+        params['fields'] = arguments.get('fields', [])
 
     # ---- Script scan (advisory, non-blocking) ----
     warnings = []
@@ -511,7 +593,7 @@ async def call_tool(name: str, arguments: dict[str, Any]):
         if name == 'execute':
             text = params.get('code', '')
             warnings = _scan_script_for_unknown_funcs(text)
-        elif name == 'set_script':
+        elif name == 'model_script' and params.get('action') == 'set':
             text = params.get('content', '')
             warnings = _scan_script_for_unknown_funcs(text)
 
@@ -548,26 +630,75 @@ def _handle_lumapi_ref(arguments):
 
 # ---- LSF builtins allowlist (never warn on these) ----
 _LSF_BUILTINS = frozenset({
+    # Control flow
     'for', 'while', 'if', 'else', 'elif', 'end', 'break', 'continue',
     'switch', 'case', 'select', 'selectall', 'groupscope',
+    # Core get/set
     'set', 'get', 'setnamed', 'getnamed',
+    # Material
     'setmaterial', 'getmaterial', 'addmaterial',
+    'deletematerial', 'copymaterial', 'materialexists',
+    'importnk', 'importdataset', 'exportdataset', 'importmaterialdb',
+    'savematerial', 'getindex', 'getfdtdindex', 'geteps',
+    # Object operations
     'delete', 'clear', 'copy', 'move', 'min', 'max', 'sqrt',
     'abs', 'sin', 'cos', 'tan', 'asin', 'acos', 'atan', 'atan2',
     'exp', 'log', 'log10', 'real', 'imag', 'conj',
     'length', 'size', 'find', 'sprintf', 'str2num', 'num2str',
     'type', 'eval', 'feval', 'run', 'runsweep',
     'write', 'read', 'matlabsave', 'load',
-    'readdata', 'loaddata', 'importdataset', 'importnk', 'readspectrum',
+    'readdata', 'loaddata',
+    # File I/O
+    'fileexists', 'fopen', 'fclose', 'fread', 'fwrite', 'format',
+    'saveh5', 'loadh5', 'matlabload', 'matlabget', 'matlabput',
+    'readtable', 'readspectrum',
+    # Layout / analysis mode
     'switchtolayout', 'layoutmode', 'analysismode',
+    # Add primitives
     'addfdtd', 'addrect', 'addcircle', 'addring',
+    'addpoly', 'add2dpoly', 'add2drect', 'addsphere',
+    'addpyramid', 'addtriangle', 'addwaveguide',
+    # Sources
     'addtfsf', 'addgaussian', 'addplane', 'adddipole',
+    # Monitors
     'addpower', 'addmovie', 'addindex', 'addfield',
-    'addmesh', 'addvar', 'setvar', 'getvar', 'adduserprop',
-    'farfield', 'farfield3d', 'farfieldpolar', 'farfieldpolar2d', 'farfieldpolar3d',
+    'adddftmonitor',
+    # Mesh
+    'addmesh',
+    # Groups
+    'addstructuregroup', 'addanalysisgroup', 'addassemblygroup',
+    'addgroup', 'addtogroup',
+    # Ports / EME / import
+    'addimport', 'addmode', 'addport', 'addeme',
+    # Variables & user properties
+    'addvar', 'setvar', 'getvar', 'addvarfdtd',
+    'adduserprop', 'addanalysisprop', 'addanalysisresult',
+    'addimportnk',
+    # Sweep
+    'addsweepparameter', 'addsweepresult',
+    'removesweepparameter', 'removesweepresult',
+    'getsweep', 'getsweepdata', 'deletesweep',
+    'copysweep', 'pastesweep', 'insertsweep',
+    'setsweep',
+    # Results
+    'getresult', 'getdata', 'getresultdata',
+    'getelectric', 'getmagnetic',
+    'listresults', 'findresult', 'clearresults', 'clearanalysis',
+    'haveresult',
+    # Farfield / transmission
+    'farfield', 'farfield3d', 'farfieldpolar',
+    'farfieldpolar2d', 'farfieldpolar3d',
     'transmission', 'dipolepower',
-    'getresult', 'getdata', 'haveresult', 'findresult',
-    'getpath', 'save', 'close',
+    # Analysis / setup run
+    'runsetup', 'runanalysis',
+    'getpath',
+    # BC / EME profile
+    'addbc', 'addemeprofile', 'addemeindex', 'addeffectiveindex',
+    # Math / string
+    'amax', 'amin',
+    'substring', 'findstring', 'replace', 'replacestring',
+    # System / misc
+    'system', 'save', 'close',
 })
 
 
@@ -581,7 +712,6 @@ def _scan_script_for_unknown_funcs(text):
     if not text:
         return []
     called = _scan_script_for_funcs(text)
-    # Only flag calls NOT in known set AND NOT in LSF builtins
     unknown = called - _LUMAPI_NAMES - _LSF_BUILTINS
     if not unknown:
         return []
@@ -591,7 +721,7 @@ def _scan_script_for_unknown_funcs(text):
         + ', '.join(sorted_u) + '. '
         'Not every unrecognized name is wrong (some are your custom functions). '
         'If you intended to call a Lumerical API function, first call '
-        'get_lumapi_ref(list_only=true) to check it exists and get the correct signature.'
+        'reference_lookup(list_only=true) to check it exists and get the correct signature.'
     )
     return [msg]
 

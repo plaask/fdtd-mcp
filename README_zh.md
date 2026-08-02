@@ -33,13 +33,9 @@ pip install .
 python install.py
 ```
 
-自动发现 Lumerical 安装路径并打印注册命令，执行后重启 Claude Code 即可。
+自动发现 Lumerical 安装路径并打印注册命令（含检测到的 `--lumerical-home`），执行后重启 Claude Code 即可。
 
-如果自动发现成功，打印的命令就是最简单的形式：
-
-```
-claude mcp add fdtd -- python -m fdtd_mcp.server
-```
+如果 `fdtd-mcp` 不在 PATH 上，把打印出的命令里的 `fdtd-mcp` 换成 `python -m fdtd_mcp.server`。
 
 ### 如果自动发现失败
 
@@ -87,29 +83,110 @@ claude mcp add fdtd -- python -m fdtd_mcp.server
 }
 ```
 
-## 工具（27 个）
+## 工具（30 个，6 个模块）
 
-| 类别 | 工具 |
-|------|------|
-| 生命周期 | `new`, `open`, `close`, `save` |
-| 总览 | `get_model_overview` |
-| 审阅 | `get_scene_info`, `get_object_info`, `get_model_variables`, `get_script`, `get_parameters`, `get_sweep_info` |
-| 知识库 | `get_lumapi_ref` |
-| 编辑 | `set_parameter`, `set_script` |
-| 执行 | `execute`, `execute_file` |
-| 材料 | `add_material`, `set_material`, `get_material` |
-| 运行 | `run`, `run_sweep`, `get_sweep_result` |
-| 数据 | `get_results`, `list_result_fields`, `get_result_data`, `get_result_file`, `has_result` |
+```
+session (5)     session_open, session_new, session_close,
+                session_save, session_save_as
+
+model (6)       model_info, model_add, model_get, model_set,
+                model_delete, model_script
+
+material (5)    material_add, material_get, material_set,
+                material_delete, material_exists
+
+sweep (6)       sweep_add, sweep_get, sweep_set, sweep_delete,
+                sweep_run, sweep_result
+
+result (4)      result_list, result_get, result_save, result_has
+
+engine (4)      run, execute, execute_file, reference_lookup
+```
+
+`run` / `sweep_run` 在求解前会自动把未保存的工程存到临时路径，避免隐藏引擎被 Lumerical 不可见的"Save As"对话框堵住。注意：`addvar` 在 v202 **已废弃**——模型变量需在 GUI 里建，否则 `sweep_add` 的参数路径（如 `::model>gap`）无法解析。
+
+| 模块 | 用途 | 工具 |
+|------|------|------|
+| **session** | 工程文件生命周期 | `session_open`, `session_new`, `session_close`, `session_save`, `session_save_as` |
+| **model** | 对象树统一 CRUD | `model_info`, `model_add`, `model_get`, `model_set`, `model_delete`, `model_script` |
+| **material** | 材料数据库 | `material_add`, `material_get`, `material_set`, `material_delete`, `material_exists` |
+| **sweep** | 参数扫描生命周期 | `sweep_add`, `sweep_get`, `sweep_set`, `sweep_delete`, `sweep_run`, `sweep_result` |
+| **result** | 仿真数据 | `result_list`, `result_get`, `result_save`, `result_has` |
+| **engine** | 直接操作引擎 | `run`, `execute`, `execute_file`, `reference_lookup` |
 
 ## 使用示例
 
 ### 打开并审阅
 
 ```
-open("my_sim.fsp")
-get_model_overview()                 → 对象、变量、材料（单次自省，防跳步）
-get_script("::model")                → setup + analysis 脚本
-get_parameters()                     → 全部模型和分组参数
+session_open("D:/project/my_sim.fsp")
+model_info()                          → 对象、材料、变量、FDTD 摘要（单次自省，防跳步）
+model_get("FDTD")                     → FDTD 区域完整属性
+model_script("::model", action="get") → setup + analysis 脚本
+```
+
+### 从零搭建
+
+```
+session_new(dimension="3D", x_span=2e-6, y_span=2e-6, mesh_accuracy=4)
+
+model_add(type="fdtd")
+model_add(type="rectangle", name="substrate",
+          properties={"x span": 2e-6, "y span": 2e-6, "z span": 200e-9})
+model_add(type="dipole", name="source_1")
+
+model_set(name="substrate", properties={"material": "Si (Silicon) - Palik"})
+model_set(name="source_1", properties={"x": 0, "y": 0, "z": 100e-9})
+session_save(path="new_sim.fsp")
+```
+
+### 自定义材料
+
+```
+material_add(type="Sampled 3D data")                 → {name: "material_1"}
+material_set(name="material_1", property="name", value="PA_RCP")
+material_set(name="material_1", property="sampled 3d data",
+             value=[[300e-9,1.5,0],[800e-9,1.5,0]])
+material_set(name="material_1", property="mesh order", value=2)
+model_set(name="substrate", properties={"material": "PA_RCP"})
+
+# 或者从文件导入
+execute('importnk("D:/data/nk_data.txt")')
+```
+
+### 结构组与分析组
+
+```
+model_add(type="structure_group", name="dbr_stack")
+model_script(name="dbr_stack", action="set", script_type="script",
+             content="addrect(); set('name', 'layer'); set('x span', 2e-6);")
+
+model_add(type="analysis_group", name="transmission_calc")
+model_script(name="transmission_calc", action="set", script_type="analysis",
+             content="T = transmission('monitor');")
+```
+
+### 运行取结果
+
+```
+run()
+result_has(monitor="DFT")              → 安全存在性检查，取数据前先调用
+result_list(monitor="DFT")             → 发现可用数据集
+result_get(monitor="DFT", data="E",
+           fields=["Ex","Ey","f"])    → 指定字段（fields 必填）
+result_save(monitor="DFT", data="E", output="C:/data/fields.mat")
+                                       → 完整导出 .mat
+```
+
+### 参数扫描
+
+```
+sweep_add(type=0, name="thickness_sweep",
+  parameters=[{"name":"t","parameter":"::model::substrate::z span",
+               "start":50e-9,"stop":300e-9,"points":6}],
+  results=[{"name":"T","result":"::model::monitor::T"}])
+sweep_run(name="thickness_sweep")
+sweep_result(name="thickness_sweep", result="T")
 ```
 
 ### 抗幻觉工作流
@@ -117,62 +194,16 @@ get_parameters()                     → 全部模型和分组参数
 大模型对 Lumerical FDTD 的训练语料稀缺，容易臆造函数名、对象类型和变量名。以下工具帮助解决：
 
 ```
-get_model_overview()                 → 对象（默认过滤禁用）、
-                                        GUI 模型变量（LD, DBR, top_layer, au, ...）、
-                                        材料清单 — 一次拿到全部上下文
+reference_lookup(list_only=true)       → 写脚本前确认函数名是否存在
+                                         （内置 32 条常用 API 签名库）
+reference_lookup(name="addrect")       → 查看签名与陷阱
+execute("?getnamed('FDTD', 'dimension')")  → ?expr 捕获返回值
 
-get_lumapi_ref(list_only=true)       → 写脚本前确认函数名是否存在
-                                        （内置 32 条常用 API 签名库）
+model_info()                           → 对象、GUI 模型变量、材料清单一次拿全
+model_get("source_1")                  → 显式类型 + source_kind 判别器
 
-get_object_info("source_1")          → 显式类型 + source_kind 判别器
-                                        （dipole / plane / tfsf / gaussian）
-
-脚本扫描                              → execute() 和 set_script() 对不能识别的
-                                        函数名返回非阻塞警告
-```
-
-### 修改并保存
-
-```
-set_parameter("wavelength", 1550e-9)
-set_script("::model", "analysis", "plot_spectrum();")
-save("my_sim_v2.fsp")
-```
-
-### 运行取结果
-
-```
-run()
-get_results("monitor1")              → 列出可用数据集
-list_result_fields("monitor1", "E")  → 预览字段名（Ex, Ey, Ez, ...）
-get_result_data("monitor1", "E", fields=["Ex","T","f"])
-                                     → 多字段数据（不再限于 f/lambda）
-has_result("monitor1")               → 安全存在性检查，取数据前先调用
-get_result_file("monitor1", "E", "C:/data/fields.mat")
-                                     → 完整导出为 .mat 文件
-```
-
-### 从零搭建
-
-```
-new(dimension="3D", x_span=2e-6, y_span=2e-6, z_span=2e-6, mesh_accuracy=4)
-execute("addrect()")
-set_parameter("x span", 500e-9, object="rectangle")
-set_parameter("material", "Si (Silicon) - Palik", object="rectangle")
-execute("addfdtd()")
-save("new_sim.fsp")
-```
-
-### 自定义材料
-
-```
-add_material(type="Sampled 3D data")                 → {name: "material_1"}
-set_material("material_1", "nk data",
-  [[300e-9,800e-9], [1.52,1.52], [0.001,0.001]])
-set_material("material_1", "mesh order", 2)
-# 内置材料直接使用：
-execute("addrect()")
-set_parameter("material", "Au (Gold) - Johnson and Christy", object="rectangle")
+脚本扫描                               → execute() 和 model_script(action="set")
+                                         对无法识别的函数名返回非阻塞警告
 ```
 
 ## 文件结构
@@ -184,13 +215,15 @@ fdtd-mcp/
 ├── LICENSE
 ├── pyproject.toml
 ├── install.py
-└── fdtd_mcp/
-    ├── __init__.py
-    ├── discovery.py   # Lumerical 路径自动发现
-    ├── bridge.py      # JSON-RPC 桥接
-    ├── server.py      # MCP 服务器
-    └── cheatsheet/
-        └── lumapi_ref.json  # 32 条 Lumerical API 参考
+├── fdtd_mcp/
+│   ├── __init__.py
+│   ├── discovery.py   # Lumerical 路径自动发现
+│   ├── dispatch.json  # 工具名 -> bridge handler 的唯一映射表
+│   ├── bridge.py      # JSON-RPC 桥接（Lumerical Python 3.6.8）
+│   ├── server.py      # MCP 服务器（系统 Python）
+│   └── cheatsheet/
+│       └── lumapi_ref.json  # 32 条 Lumerical API 参考
+└── tests/             # pytest 测试（无需 Lumerical）
 ```
 
 ## 依赖

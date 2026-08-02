@@ -1,6 +1,6 @@
 {
   "meta": {
-    "scope": "Commonly-used Lumerical script API subset — NOT exhaustive. If a function is not listed here, do NOT assume its signature; call get_lumapi_ref(list_only=true) or check Lumerical documentation.",
+    "scope": "Commonly-used Lumerical script API subset — NOT exhaustive. If a function is not listed here, do NOT assume its signature; call reference_lookup(list_only=true) or check Lumerical documentation.",
     "verified_against": "pending",
     "note": "Each entry's verified_against should be updated to the Lumerical version (e.g. '241') after live verification. Mark 'pending' until then."
   },
@@ -218,62 +218,54 @@
     "verified_against": "proven — used in _cmd_get_material"
   },
   "addvar": {
-    "signature": "addvar(\"name\", \"initial_value\")  (exact signature PENDING verification)",
-    "returns": "none (adds a variable to the Model Variables table)",
-    "valid_args": {
-      "name": "variable name (shown in GUI Variables tab)",
-      "initial_value": "initial value (number, string)"
-    },
+    "signature": "NOT AVAILABLE in v202 — 'addvar is not a valid function or variable name'.",
+    "returns": "n/a",
+    "valid_args": {},
     "common_pitfalls": [
-      "Model variables declared via addvar appear in the Variables tab, NOT as getnamed(\"::model\", name) properties",
-      "Signature needs live verification against installed Lumerical version"
+      "Verified on v202 (2026-08): addvar/addvarfdtd/setvar/getvar are all dead via LSF/appCall",
+      "Model variables must be created in the GUI (Model Variables tab)",
+      "sweep parameter paths like ::model>gap require the variable to already exist",
+      "Writing addvar into a script does not help — the command is gone in v202"
     ],
     "category": "variable",
-    "verified_against": "pending"
+    "verified_against": "proven — dead on v202"
   },
   "setvar": {
-    "signature": "setvar(\"scope\", \"name\", value)  (exact signature PENDING verification)",
-    "returns": "none (sets a model variable's value in a scope)",
-    "valid_args": {
-      "scope": "'::model' or structure group name",
-      "name": "variable name",
-      "value": "new value"
-    },
+    "signature": "NOT AVAILABLE in v202 (same as addvar).",
+    "returns": "n/a",
+    "valid_args": {},
     "common_pitfalls": [
-      "Scope-aware — setvar('::model', 'LD', val) vs setvar('::model::group', 'param', val)",
-      "Signature needs live verification; getnamed may be equivalent for model-level vars"
+      "Dead on v202 — use getnamed/setnamed on existing properties instead"
     ],
     "category": "variable",
-    "verified_against": "pending"
+    "verified_against": "proven — dead on v202"
   },
   "getvar": {
-    "signature": "getvar(\"scope\", \"name\")  (exact signature PENDING verification)",
-    "returns": "variable value",
-    "valid_args": {
-      "scope": "'::model' or structure group scope",
-      "name": "variable name"
-    },
+    "signature": "NOT AVAILABLE in v202 (same as addvar).",
+    "returns": "n/a",
+    "valid_args": {},
     "common_pitfalls": [
-      "Scope-aware — may differ from getnamed(\"::model\", name) for variables declared via addvar",
-      "Signature needs live verification"
+      "Dead on v202 — use getnamed/getv on existing properties instead"
     ],
     "category": "variable",
-    "verified_against": "pending"
+    "verified_against": "proven — dead on v202"
   },
   "adduserprop": {
-    "signature": "adduserprop(\"name\", value)  — called from within an object's setup script",
+    "signature": "adduserprop(\"name\", type_code, value)  — called from within a group's setup script (which executes immediately on model_script set)",
     "returns": "none (adds a user-defined property to an analysis/structure group)",
     "valid_args": {
       "name": "property name",
+      "type_code": "INTEGER 0-5: 0=number, 1=text, 2=length, 3=time, 4=frequency, 5=material",
       "value": "default value"
     },
     "common_pitfalls": [
-      "adduserprop is called in setup scripts (not directly via execute)",
-      "Properties created via adduserprop are read via getnamed(obj, \"name\")",
-      "Currently discovered by regex-scanning setup script text in get_parameters"
+      "The 2-arg form adduserprop('name', value) FAILS on v202 and aborts the whole group script (no children/props created)",
+      "The string-type form adduserprop('name', value, 'Length') ALSO FAILS on v202 ('Property value is the wrong type') — type must be the INTEGER code, e.g. adduserprop('thickness', 2, 100e-9)",
+      "addanalysisprop mirrors this for analysis groups",
+      "Properties created via adduserprop are read via getnamed(obj, \"name\") and settable via model_set"
     ],
     "category": "variable",
-    "verified_against": "proven — regex-scanned in get_parameters"
+    "verified_against": "proven — integer type-code form on v202"
   },
   "select": {
     "signature": "select(\"object_name\")",

@@ -3,6 +3,10 @@ __pycache__/
 *.pyc
 *.pyo
 
+# Test / cache artifacts
+.pytest_cache/
+tmp/
+
 # FDTD simulation files
 *.fsp
 *.ldf

@@ -9,12 +9,30 @@ Architecture:
                                 | lumapi
                              Lumerical FDTD engine
 """
-import sys, os, json, subprocess, threading, re
+import sys, os, json, subprocess, threading, re, queue, logging
+import anyio
+from collections import deque
 from typing import Any
 from mcp import types
 from mcp.server import Server
 from mcp.server.stdio import stdio_server
 from .discovery import find_lumerical, find_lumerical_python
+
+# Per-call timeout (seconds). OFF by default so legitimate long simulations are
+# never killed mid-run. Set FDTD_MCP_CALL_TIMEOUT (or pass timeout= on a single
+# call to run/sweep_run/execute/execute_file) to bound a call: on expiry the
+# bridge process tree is killed and auto-restarted on the next call, so a wedged
+# engine cannot freeze the session forever. Note the kill discards unsaved
+# in-memory engine state.
+_CALL_TIMEOUT = None
+try:
+    _t = os.environ.get('FDTD_MCP_CALL_TIMEOUT')
+    if _t is not None and _t.strip() != '':
+        _CALL_TIMEOUT = float(_t)
+        if _CALL_TIMEOUT <= 0:
+            _CALL_TIMEOUT = None
+except ValueError:
+    pass
 
 # ---- Bundled lumapi ref data (server-side only) ----
 _CHEATSHEET_PATH = os.path.join(os.path.dirname(__file__), 'cheatsheet', 'lumapi_ref.json')
@@ -27,6 +45,19 @@ if os.path.exists(_CHEATSHEET_PATH):
         _LUMAPI_NAMES = set(k for k in _LUMAPI_REF if k != 'meta')
     except Exception:
         pass
+
+# ---- Single source of truth for tool dispatch (shared with bridge.py) ----
+# Maps MCP tool name -> bridge method name. Load-bearing: both processes read
+# the same JSON, so the two dispatch tables can no longer drift. Tools listed
+# under "_server_only" have no bridge round-trip (handled in server.py); tools
+# under "_hidden" are still dispatchable but not advertised to the LLM.
+_DISPATCH_PATH = os.path.join(os.path.dirname(__file__), 'dispatch.json')
+with open(_DISPATCH_PATH, 'r', encoding='utf-8') as _f:
+    _DISPATCH_RAW = json.load(_f)
+_SERVER_ONLY_TOOLS = frozenset(_DISPATCH_RAW.get('_server_only', []))
+_HIDDEN_TOOLS = frozenset(_DISPATCH_RAW.get('_hidden', []))
+_DISPATCH = {k: v for k, v in _DISPATCH_RAW.items()
+             if k not in ('_server_only', '_hidden')}
 
 
 def _get_lumerical_home():
@@ -46,8 +77,25 @@ BRIDGE_SCRIPT = os.path.join(os.path.dirname(__file__), 'bridge.py')
 
 
 class BridgeClient(object):
+    """Subprocess bridge to the Lumerical FDTD engine.
+
+    stdout is drained by a background reader thread into a queue so calls never
+    block the event loop and EOF (crash) is detected immediately. stderr is
+    drained by a separate thread to avoid a full pipe-buffer deadlock.
+    """
+
     def __init__(self):
-        self._proc = None; self._lock = threading.Lock(); self._req_id = 0
+        self._proc = None
+        self._lock = threading.Lock()
+        self._req_id = 0
+        self._resp_queue = None
+        self._dead = False
+        self._stderr_lines = deque(maxlen=200)
+
+    def is_dead(self):
+        if self._dead or self._proc is None:
+            return True
+        return self._proc.poll() is not None
 
     def start(self):
         env = os.environ.copy()
@@ -57,30 +105,142 @@ class BridgeClient(object):
             [LUMERICAL_PYTHON, BRIDGE_SCRIPT, '--lumerical-home', LUMERICAL_HOME],
             stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
             env=env, text=True, encoding='utf-8')
-        if not json.loads(self._proc.stdout.readline()).get('ready'):
+        self._dead = False
+        self._resp_queue = queue.Queue()
+        threading.Thread(target=self._read_loop, daemon=True,
+                         name='bridge-reader').start()
+        threading.Thread(target=self._stderr_loop, daemon=True,
+                         name='bridge-stderr').start()
+        try:
+            line = self._resp_queue.get(timeout=30)
+        except queue.Empty:
+            self._dead = True
+            raise RuntimeError('Bridge failed to send ready handshake')
+        if line is None:
+            self._dead = True
+            raise RuntimeError('Bridge closed before ready handshake')
+        try:
+            ready = json.loads(line)
+        except (ValueError, TypeError):
+            self._dead = True
+            raise RuntimeError('Bridge failed to start: bad handshake')
+        if not (isinstance(ready, dict) and ready.get('ready')):
+            self._dead = True
             raise RuntimeError('Bridge failed to start')
 
+    def _read_loop(self):
+        try:
+            while True:
+                line = self._proc.stdout.readline()
+                if not line:
+                    break
+                self._resp_queue.put(line)
+        except Exception:
+            pass
+        finally:
+            self._dead = True
+            self._resp_queue.put(None)  # EOF sentinel (responses are never None)
+
+    def _stderr_loop(self):
+        try:
+            for line in self._proc.stderr:
+                line = line.rstrip('\n')
+                if line:
+                    self._stderr_lines.append(line)
+                    logging.debug('[bridge] %s', line)
+        except Exception:
+            pass
+
+    def stderr_tail(self):
+        return list(self._stderr_lines)
+
     def stop(self):
-        if not self._proc: return
-        try: self._call('shutdown', {})
-        except Exception: pass
-        try: self._proc.stdin.close(); self._proc.wait(timeout=5)
-        except Exception: self._proc.kill()
+        proc = self._proc
+        if not proc:
+            return
+        self._dead = True
+        try:
+            if proc.stdin:
+                try:
+                    proc.stdin.write(json.dumps(
+                        {'id': self._req_id + 1, 'method': 'shutdown',
+                         'params': {}}) + '\n')
+                    proc.stdin.flush()
+                except Exception:
+                    pass
+                try:
+                    proc.stdin.close()
+                except Exception:
+                    pass
+        except Exception:
+            pass
+        try:
+            proc.wait(timeout=5)
+        except Exception:
+            try:
+                proc.kill()
+            except Exception:
+                pass
         self._proc = None
+        self._resp_queue = None
 
-    def call(self, method, params=None):
-        with self._lock: return self._call(method, params or {})
+    def call(self, method, params=None, timeout=None):
+        with self._lock:
+            return self._call(method, params or {}, timeout)
 
-    def _call(self, method, params):
+    def _kill_bridge_tree(self):
+        """Kill the bridge and its children (taskkill /T) so a wedged run()
+        does not leave an orphaned fdtd-solutions solver process behind."""
+        proc = self._proc
+        if proc is None:
+            return
+        try:
+            subprocess.run(
+                ['taskkill', '/PID', str(proc.pid), '/T', '/F'],
+                capture_output=True, timeout=15)
+        except Exception:
+            pass
+        try:
+            proc.kill()
+        except Exception:
+            pass
+
+    def _call(self, method, params, timeout=None):
+        if timeout is None:
+            timeout = _CALL_TIMEOUT  # resolve global at call time
+        if self._dead or self._proc is None:
+            raise RuntimeError('Bridge is not running')
         self._req_id += 1
-        self._proc.stdin.write(json.dumps({'id': self._req_id, 'method': method, 'params': params}) + '\n')
-        self._proc.stdin.flush()
-        line = self._proc.stdout.readline()
-        if not line: raise RuntimeError('Bridge closed')
+        try:
+            self._proc.stdin.write(json.dumps(
+                {'id': self._req_id, 'method': method, 'params': params}) + '\n')
+            self._proc.stdin.flush()
+        except Exception as e:
+            self._dead = True
+            raise RuntimeError('Bridge write failed: ' + str(e))
+        try:
+            if timeout:
+                line = self._resp_queue.get(timeout=timeout)
+            else:
+                line = self._resp_queue.get()
+        except queue.Empty:
+            # A timed-out call means the engine is wedged (e.g. blocked on a
+            # license). Kill the bridge tree and mark dead so the next call
+            # auto-restarts a fresh engine instead of queueing forever.
+            self._dead = True
+            self._kill_bridge_tree()
+            raise RuntimeError(
+                'Bridge call timed out after %.0fs (FDTD_MCP_CALL_TIMEOUT). '
+                'The bridge was killed and will auto-restart; reopen your '
+                'project if the engine state was lost.' % (timeout or 0))
+        if line is None:
+            self._dead = True
+            raise RuntimeError('Bridge closed')
         resp = json.loads(line)
         if 'error' in resp:
             msg = resp['error'].get('message', str(resp['error']))
-            if 'Traceback' in msg: msg = msg.split('\n')[0]
+            if 'Traceback' in msg:
+                msg = msg.split('\n')[0]
             raise RuntimeError(msg)
         return resp.get('result')
 
@@ -347,17 +507,26 @@ TOOLS = [
             '\n'
             'Types: 0=parameter sweep, 1=optimization, 2=monte carlo, 3=s-parameter\n'
             '\n'
+            'Parameter dicts use keys: name, parameter (the object property path to\n'
+            'sweep, e.g. "::model::substrate::z span" — use "::" separators, NOT ">":\n'
+            '"::model>gap" registers but does NOT resolve at runtime), start, stop,\n'
+            'and points (number of sample points; applied at the sweep level).\n'
+            'Sampling is Linear by default — do NOT set a per-parameter "type" sampling\n'
+            'string; "type" is the parameter VALUE data type and should be omitted\n'
+            '(or "Number"). Model variables (addvar) are gone in v202 — sweep a real\n'
+            'object property instead.\n'
+            '\n'
             'Example:\n'
-            '  sweep_add(name="gap_sweep", type=0,\n'
-            '    parameters=[{"name":"gap","parameter":"::model>gap",\n'
-            '                 "type":"Linear","start":100e-9,"stop":300e-9,"points":5}],\n'
-            '    results=[{"name":"T","result":"DFT>T"}])'
+            '  sweep_add(name="thickness_sweep", type=0,\n'
+            '    parameters=[{"name":"t","parameter":"::model::substrate::z span",\n'
+            '                 "start":100e-9,"stop":300e-9,"points":5}],\n'
+            '    results=[{"name":"T","result":"::model::transmission_calc::T"}])'
         ),
         inputSchema={'type':'object','properties':{
             'type':{'type':'integer','description':'Sweep type: 0=parameter, 1=optimization, 2=monte carlo, 3=s-parameter (default 0)'},
             'name':{'type':'string','description':'Sweep name'},
-            'parameters':{'type':'array','items':{'type':'object'},'description':'List of sweep parameter dicts'},
-            'results':{'type':'array','items':{'type':'object'},'description':'List of sweep result dicts'}},
+            'parameters':{'type':'array','items':{'type':'object'},'description':'List of parameter dicts: {name, parameter, start, stop, points}'},
+            'results':{'type':'array','items':{'type':'object'},'description':'List of result dicts: {name, result}'}},
             'required':['type','name']}),
     types.Tool(name='sweep_get',
         description=(
@@ -393,12 +562,16 @@ TOOLS = [
     types.Tool(name='sweep_run',
         description=(
             'Run a parameter sweep by name. Blocks until completion.\n'
+            'timeout (seconds) bounds the wait; on expiry the engine is '
+            'restarted (set 0 to wait forever, default from FDTD_MCP_CALL_TIMEOUT).\n'
             '\n'
             'Example:\n'
             '  sweep_run(name="gap_sweep")'
         ),
         inputSchema={'type':'object','properties':{
-            'name':{'type':'string'}}, 'required':['name']}),
+            'name':{'type':'string'},
+            'timeout':{'type':'number','description':'Optional wait bound in seconds (0 = no timeout)'}},
+            'required':['name']}),
     types.Tool(name='sweep_result',
         description=(
             'Get results from a completed parameter sweep.\n'
@@ -469,17 +642,22 @@ TOOLS = [
             'when a monitor has no results (e.g. before simulation is run).\n'
             '\n'
             'Example:\n'
-            '  result_has(name="DFT") -> {exists: true}'
+            '  result_has(monitor="DFT") -> {exists: true}'
         ),
         inputSchema={'type':'object','properties':{
-            'name':{'type':'string'}}, 'required':['name']}),
+            'monitor':{'type':'string'}}, 'required':['monitor']}),
 
     # ==================================================================
     # Module: engine (4 tools)
     # ==================================================================
     types.Tool(name='run',
-        description='Run the FDTD simulation once. Blocks until completion.',
-        inputSchema={'type':'object','properties':{}}),
+        description=(
+            'Run the FDTD simulation once. Blocks until completion.\n'
+            'timeout (seconds) bounds the wait; on expiry the engine is '
+            'restarted (set 0 to wait forever, default from FDTD_MCP_CALL_TIMEOUT).'
+        ),
+        inputSchema={'type':'object','properties':{
+            'timeout':{'type':'number','description':'Optional wait bound in seconds (0 = no timeout)'}}}),
     types.Tool(name='execute',
         description=(
             'Execute LSF script code directly. Supports full multi-line LSF scripts '
@@ -502,12 +680,15 @@ TOOLS = [
             '  - Material file import:  execute(\'importnk("C:/path/to/file.txt")\')'
         ),
         inputSchema={'type':'object','properties':{
-            'code':{'type':'string','description':'LSF script code (multi-line supported)'}},
+            'code':{'type':'string','description':'LSF script code (multi-line supported)'},
+            'timeout':{'type':'number','description':'Optional wait bound in seconds (0 = no timeout)'}},
             'required':['code']}),
     types.Tool(name='execute_file',
         description='Run a Lumerical script file (.lsf).',
         inputSchema={'type':'object','properties':{
-            'path':{'type':'string'}}, 'required':['path']}),
+            'path':{'type':'string'},
+            'timeout':{'type':'number','description':'Optional wait bound in seconds (0 = no timeout)'}},
+            'required':['path']}),
     types.Tool(name='reference_lookup',
         description=(
             'Look up VERIFIED Lumerical API signature/parameter ranges BEFORE writing scripts.\n'
@@ -527,6 +708,34 @@ TOOLS = [
             'list_only':{'type':'boolean','description':'If true, return only function names (ignores name/category)'}}}),
 ]
 
+# ---- Startup validation: TOOLS and dispatch.json must agree ----
+# Hidden tools stay dispatchable (in dispatch.json) but are not advertised.
+TOOLS = [t for t in TOOLS if t.name not in _HIDDEN_TOOLS]
+_tool_names = {t.name for t in TOOLS}
+_missing = _tool_names - _SERVER_ONLY_TOOLS - set(_DISPATCH.keys())
+if _missing:
+    raise RuntimeError('Tools missing from dispatch.json: ' + ', '.join(sorted(_missing)))
+_extra = (set(_DISPATCH.keys()) | _SERVER_ONLY_TOOLS) - _tool_names - _HIDDEN_TOOLS
+if _extra:
+    raise RuntimeError('dispatch.json references unknown tools: ' + ', '.join(sorted(_extra)))
+
+# ---- Tool annotations (Claude review criteria: read/write split) ----
+_READ_ONLY_TOOLS = {
+    'model_info', 'model_get', 'material_get', 'material_exists',
+    'result_list', 'result_get', 'sweep_get', 'reference_lookup',
+}
+_DESTRUCTIVE_TOOLS = {
+    'session_open', 'session_new', 'session_close',
+    'model_delete', 'material_delete', 'sweep_delete',
+    'execute', 'execute_file',
+}
+_LONG_RUNNING_TOOLS = frozenset({'run', 'sweep_run', 'execute', 'execute_file'})
+for _t in TOOLS:
+    if _t.name in _READ_ONLY_TOOLS:
+        _t.annotations = types.ToolAnnotations(readOnlyHint=True)
+    elif _t.name in _DESTRUCTIVE_TOOLS:
+        _t.annotations = types.ToolAnnotations(destructiveHint=True)
+
 app = Server('fdtd-mcp')
 
 @app.list_tools()
@@ -534,8 +743,6 @@ async def list_tools(): return TOOLS
 
 @app.call_tool()
 async def call_tool(name: str, arguments: dict[str, Any]):
-    _ensure_bridge()
-
     # ----------------------------------------------------------------
     # Server-side tools (NO bridge round-trip)
     # ----------------------------------------------------------------
@@ -545,31 +752,11 @@ async def call_tool(name: str, arguments: dict[str, Any]):
     # ----------------------------------------------------------------
     # Bridge-dispatched tools
     # ----------------------------------------------------------------
-    method_map = {
-        # session
-        'session_open': 'open', 'session_new': 'new', 'session_close': 'close',
-        'session_save': 'save', 'session_save_as': 'save_as',
-        # model
-        'model_info': 'model_info', 'model_add': 'model_add',
-        'model_get': 'model_get', 'model_set': 'model_set',
-        'model_delete': 'model_delete', 'model_script': 'model_script',
-        # material
-        'material_add': 'add_material', 'material_get': 'get_material',
-        'material_set': 'set_material', 'material_delete': 'material_delete',
-        'material_exists': 'material_exists',
-        # sweep
-        'sweep_add': 'sweep_add', 'sweep_get': 'sweep_get',
-        'sweep_set': 'sweep_set', 'sweep_delete': 'sweep_delete',
-        'sweep_run': 'sweep_run', 'sweep_result': 'sweep_result',
-        # result
-        'result_list': 'result_list', 'result_get': 'result_get',
-        'result_save': 'result_save', 'result_has': 'result_has',
-        # engine
-        'run': 'run', 'execute': 'execute', 'execute_file': 'execute_file',
-    }
-    bm = method_map.get(name)
+    bm = _DISPATCH.get(name)
     if not bm:
         raise ValueError('Unknown tool: ' + name)
+
+    _ensure_bridge()
 
     params = dict(arguments) if arguments else {}
 
@@ -587,6 +774,14 @@ async def call_tool(name: str, arguments: dict[str, Any]):
         params['cap'] = arguments.get('cap', 2000)
         params['fields'] = arguments.get('fields', [])
 
+    # Per-call timeout override for long-running tools (0 disables the bound).
+    call_timeout = _CALL_TIMEOUT
+    if name in _LONG_RUNNING_TOOLS:
+        t = arguments.get('timeout')
+        if t is not None:
+            call_timeout = float(t) if t > 0 else 0.0
+        params.pop('timeout', None)
+
     # ---- Script scan (advisory, non-blocking) ----
     warnings = []
     if _LUMAPI_NAMES:
@@ -597,7 +792,9 @@ async def call_tool(name: str, arguments: dict[str, Any]):
             text = params.get('content', '')
             warnings = _scan_script_for_unknown_funcs(text)
 
-    result = _bridge.call(bm, params)
+    # Run the blocking bridge call off the event loop so the server stays
+    # responsive (progress/cancellation/other requests) during long calls.
+    result = await anyio.to_thread.run_sync(_bridge.call, bm, params, call_timeout)
     if result is None:
         result = {}
     if warnings:
@@ -703,8 +900,11 @@ _LSF_BUILTINS = frozenset({
 
 
 def _scan_script_for_funcs(text):
-    """Extract all \bFuncName( tokens from script text."""
-    return set(re.findall(r'(?:\b)([A-Za-z_]\w*)\s*\(', text))
+    """Extract all \bFuncName( tokens, ignoring comments and string literals."""
+    clean = re.sub(r'%.*?(\n|$)', ' ', text)  # LSF comments start with %
+    clean = re.sub(r'"[^"]*"', ' ', clean)    # double-quoted strings
+    clean = re.sub(r"'[^']*'", ' ', clean)    # single-quoted strings
+    return set(re.findall(r'(?:\b)([A-Za-z_]\w*)\s*\(', clean))
 
 
 def _scan_script_for_unknown_funcs(text):
@@ -726,11 +926,16 @@ def _scan_script_for_unknown_funcs(text):
     return [msg]
 
 _bridge_started = False
+_bridge_start_lock = threading.Lock()
 
 def _ensure_bridge():
     global _bridge_started
-    if not _bridge_started:
-        _bridge.start(); _bridge_started = True
+    with _bridge_start_lock:
+        if not _bridge_started or _bridge.is_dead():
+            if _bridge_started:
+                _bridge.stop()
+            _bridge.start()
+            _bridge_started = True
 
 def main():
     import atexit

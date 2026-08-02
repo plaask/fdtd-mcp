@@ -19,9 +19,19 @@ classifiers = [
 
 dependencies = ["mcp"]
 
+[project.optional-dependencies]
+dev = ["pytest"]
+
 [project.scripts]
 fdtd-mcp = "fdtd_mcp.server:main"
 
 [project.urls]
 Homepage = "https://github.com/plaask/fdtd-mcp"
 Repository = "https://github.com/plaask/fdtd-mcp"
+
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.package-data]
+fdtd_mcp = ["cheatsheet/*.json", "dispatch.json"]

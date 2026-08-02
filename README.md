@@ -33,13 +33,9 @@ pip install .
 python install.py
 ```
 
-This auto-detects your Lumerical installation and prints the registration command. Run it, restart Claude Code, done.
+This auto-detects your Lumerical installation and prints the registration command (which includes the detected `--lumerical-home`). Run the printed command, restart Claude Code, done.
 
-If auto-detection succeeds, the printed command will be as simple as:
-
-```
-claude mcp add fdtd -- python -m fdtd_mcp.server
-```
+If `fdtd-mcp` is not on your PATH, replace it with `python -m fdtd_mcp.server` in the printed command.
 
 ### If auto-detection fails
 
@@ -106,6 +102,12 @@ result (4)      result_list, result_get, result_save, result_has
 
 engine (4)      run, execute, execute_file, reference_lookup
 ```
+
+`run` / `sweep_run` auto-save an unsaved project to a temp path before solving,
+so they never block on Lumerical's invisible "Save As" dialog when the engine is
+run hidden. Note: model variables (`addvar`) are **not available in Lumerical
+v202** — create them in the GUI, or `sweep_add` parameter paths like
+`::model>gap` will not resolve.
 
 ### Module overview
 
@@ -208,13 +210,11 @@ result_save("monitor", data="E",
 ```
 # Create and run
 sweep_add(type=0, name="thickness_sweep",
-  parameters=[{
-    "Name": "t", "Parameter": "::model::substrate::z span",
-    "Type": "Length", "Start": 50e-9, "Stop": 300e-9
-  }],
-  results=[{"Name": "T", "Result": "::model::monitor::T"}])
-sweep_run("thickness_sweep")
-sweep_result("thickness_sweep", "T")   → get sweep data
+  parameters=[{"name": "t", "parameter": "::model::substrate::z span",
+               "start": 50e-9, "stop": 300e-9, "points": 6}],
+  results=[{"name": "T", "result": "::model::monitor::T"}])
+sweep_run(name="thickness_sweep")
+sweep_result(name="thickness_sweep", result="T")   → get sweep data
 ```
 
 ### Anti-hallucination
@@ -228,6 +228,7 @@ execute("?getnamed('FDTD', 'dimension')")  → ?expr captures return value
 ## Key design principles
 
 - **Unified CRUD** — every module uses consistent `add`/`get`/`set`/`delete` naming
+- **Single-source dispatch** — `dispatch.json` maps every tool to its bridge handler; both processes read the same table, so the two sides can't drift (and a test enforces it)
 - **Execute is transparent** — `execute(code)` passes LSF directly to the engine with no parsing
 - **model_set handles variables automatically** — uses `addvar`/`addanalysisprop`/`adduserprop` based on object type
 - **result_get requires fields** — call `result_list` first to discover available fields, then request only what you need
@@ -242,13 +243,15 @@ fdtd-mcp/
 ├── LICENSE
 ├── pyproject.toml
 ├── install.py
-└── fdtd_mcp/
-    ├── __init__.py
-    ├── discovery.py      # auto-detect Lumerical installation
-    ├── bridge.py         # JSON-RPC bridge (Lumerical Python 3.6.8)
-    ├── server.py         # MCP server (system Python)
-    └── cheatsheet/
-        └── lumapi_ref.json  # Lumerical API reference
+├── fdtd_mcp/
+│   ├── __init__.py
+│   ├── discovery.py      # auto-detect Lumerical installation
+│   ├── dispatch.json     # single source of truth for tool -> bridge handler
+│   ├── bridge.py         # JSON-RPC bridge (Lumerical Python 3.6.8)
+│   ├── server.py         # MCP server (system Python)
+│   └── cheatsheet/
+│       └── lumapi_ref.json  # Lumerical API reference
+└── tests/                # pytest suite (no Lumerical needed)
 ```
 
 ## Requirements
@@ -256,3 +259,13 @@ fdtd-mcp/
 - Python ≥ 3.10
 - Lumerical FDTD (v202 or later)
 - `mcp`
+
+## Timeouts for long-running calls
+
+`run`, `sweep_run`, `execute`, `execute_file` block until the engine finishes.
+By default there is **no timeout**, so legitimate long simulations are never cut
+short. If you want a bound (e.g. to stop a hung engine freezing the session),
+set the `FDTD_MCP_CALL_TIMEOUT` env var in seconds, or pass `timeout=<seconds>`
+to a single call. On expiry the bridge is killed and auto-restarted on the next
+call — note this discards unsaved in-memory engine state, so save your project
+before running long simulations.

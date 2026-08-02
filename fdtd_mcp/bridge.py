@@ -31,54 +31,65 @@ import lumapi
 from lumapi import appCall
 
 
+# ---- Single source of truth for tool dispatch (shared with server.py) ----
+# Maps MCP tool name -> bridge method name. Convention: method name == the
+# '_cmd_<method>' handler on FdtdBridge. Kept in JSON so the Python 3.6.8
+# bridge and the >=3.10 server both read the same table with no drift.
+# "_server_only" entries have no bridge round-trip and "_hidden" entries are
+# not advertised to the LLM; both are skipped when building the dispatch map.
+_DISPATCH_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'dispatch.json')
+try:
+    with open(_DISPATCH_PATH, 'r', encoding='utf-8') as _f:
+        _DISPATCH_RAW = json.load(_f)
+    _DISPATCH = {k: v for k, v in _DISPATCH_RAW.items()
+                 if k not in ('_server_only', '_hidden')}
+except Exception as _e:
+    raise RuntimeError('Failed to load dispatch.json: ' + str(_e))
+
+# Unified error channel: handlers raise BridgeError; handle() turns it into the
+# single {'error': {code, message}} shape. Generic exceptions are the second,
+# traceback-derived channel (used for unexpected engine errors).
+class BridgeError(RuntimeError):
+    pass
+
+_ERR_MSG = 300          # cap for error-message strings
+_TRUNC = 1000           # default per-array element cap for _sanitize
+
+# LSF commands that start a solve; executing any of these on an unsaved project
+# pops an invisible 'Save As' dialog that wedges the hidden engine.
+_RUN_COMMAND = re.compile(r'(?<![A-Za-z_])(run|runsweep|runanalysis|runsweepanalysis|runmany)\b')
+
+
 class FdtdBridge(object):
 
     def __init__(self):
         self._fsp = None
         self._path = None
         self._tmp_dir = os.environ.get('TEMP', os.environ.get('TMP', '/tmp'))
-        self._method_map = {
-            'ping': self._cmd_ping,
-            'open': self._cmd_open,
-            'close': self._cmd_close,
-            'save': self._cmd_save,
-            'new': self._cmd_new,
-            'execute': self._cmd_execute,
-            'execute_file': self._cmd_execute_file,
-            'get_scene_info': self._cmd_get_scene_info,
-            'get_model_variables': self._cmd_get_model_variables,
-            'get_model_overview': self._cmd_get_model_overview,
-            'model_info': self._cmd_get_model_overview,
-            'get_object_info': self._cmd_get_object_info,
-            'model_get': self._cmd_get_object_info,
-            'model_add': self._cmd_model_add,
-            'model_set': self._cmd_model_set,
-            'model_delete': self._cmd_model_delete,
-            'model_script': self._cmd_model_script,
-            'get_script': self._cmd_get_script,
-            'set_script': self._cmd_set_script,
-            'get_parameters': self._cmd_get_object_info,
-            'set_parameter': self._cmd_model_set,
-            'get_sweep_info': self._cmd_get_sweep_info,
-            'add_material': self._cmd_add_material,
-            'set_material': self._cmd_set_material,
-            'get_material': self._cmd_get_material,
-            'material_delete': self._cmd_delete_material,
-            'material_exists': self._cmd_material_exists,
-            'sweep_add': self._cmd_sweep_add,
-            'sweep_set': self._cmd_sweep_set,
-            'sweep_delete': self._cmd_sweep_delete,
-            'get_results': self._cmd_get_results,
-            'result_list': self._cmd_result_list,
-            'list_result_fields': self._cmd_list_result_fields,
-            'get_result_data': self._cmd_result_get,
-            'result_get': self._cmd_result_get,
-            'get_result_file': self._cmd_get_result_file,
-            'has_result': self._cmd_has_result,
-            'run': self._cmd_run,
-            'run_sweep': self._cmd_run_sweep,
-            'get_sweep_result': self._cmd_get_sweep_result,
-        }
+        # Derive the dispatch table from dispatch.json; fail fast if a
+        # referenced method has no _cmd_<method> handler on this class.
+        self._method_map = {}
+        for _tool, _method in _DISPATCH.items():
+            _handler = getattr(self, '_cmd_' + _method, None)
+            if _handler is None:
+                raise RuntimeError(
+                    'dispatch.json references missing handler: _cmd_' + _method)
+            self._method_map[_method] = _handler
+
+    def _require_project(self):
+        """Reject a handler call when no FDTD project is open."""
+        if not self._fsp:
+            raise BridgeError('No open project')
+
+    def _select_by_name(self, name):
+        """Select an object, falling back to the ::model:: scoped path (bare
+        names often fail select() on v202 even when they resolve for getnamed)."""
+        try:
+            self._fsp.select(name)
+        except Exception:
+            if name.startswith('::'):
+                raise
+            self._fsp.select('::model::' + name)
 
     # ------------------------------------------------------------------
     # Dispatch
@@ -93,22 +104,26 @@ class FdtdBridge(object):
             if handler is None:
                 return self._error(req_id, 'Unknown method: ' + method)
             return self._ok(req_id, handler(params))
+        except BridgeError as e:
+            return self._error(req_id, str(e))
         except Exception as e:
             tb = traceback.format_exc()
             if tb and tb.strip():
-                msg = tb.strip().split('\n')[-1][:2000]
+                msg = tb.strip().split('\n')[-1][:_ERR_MSG]
             else:
-                msg = str(e)[:2000]
+                msg = str(e)[:_ERR_MSG]
             return self._error(req_id, msg)
 
     # ------------------------------------------------------------------
     # Lifecycle
     # ------------------------------------------------------------------
 
-    def _cmd_ping(self, p):
-        return 'pong'
-
-    def _cmd_open(self, p):
+    def _cmd_session_open(self, p):
+        if self._fsp:
+            try:
+                self._fsp.close()
+            except Exception:
+                pass
         self._fsp = lumapi.FDTD(p['path'], hide=True)
         self._path = p['path']
         s = {}
@@ -121,21 +136,24 @@ class FdtdBridge(object):
                 s[k] = None
         return {'status':'ok','path':p['path'],'summary':s}
 
-    def _cmd_close(self, p):
+    def _cmd_session_close(self, p):
         if self._fsp:
             self._fsp.close()
         self._fsp = None
         self._path = None
         return {'status':'closed'}
 
-    def _cmd_save(self, p):
-        if not self._fsp:
-            raise RuntimeError('No open project')
-        self._fsp.save(p['path'])
-        self._path = p['path']
-        return {'status':'ok','path':p['path']}
+    def _cmd_session_save(self, p):
+        self._require_project()
+        path = p.get('path') or self._path
+        if not path:
+            raise RuntimeError(
+                'Project has no current file path. Pass path= to session_save.')
+        self._fsp.save(path)
+        self._path = path
+        return {'status':'ok','path':path}
 
-    def _cmd_new(self, p):
+    def _cmd_session_new(self, p):
         """Create a blank FDTD project (no .fsp file needed).
 
         Optional FDTD region config: dimension, x/y/z span, simulation time, mesh accuracy.
@@ -147,7 +165,7 @@ class FdtdBridge(object):
         self._call_lsf('addfdtd')
         cfg = {}
         for k in ['dimension','x span','y span','z span','simulation time','mesh accuracy']:
-            v = p.get(k)
+            v = p.get(k, p.get(k.replace(' ', '_')))
             if v is not None:
                 try:
                     self._fsp.setnamed('FDTD', k, v)
@@ -162,16 +180,15 @@ class FdtdBridge(object):
 
     def _cmd_execute(self, p):
         """Execute LSF code. ?expr captures return value; everything else is transparent eval."""
-        if not self._fsp:
-            raise RuntimeError('No open project')
+        self._require_project()
         code = p['code']
 
-        # Guard: reject raw set("...script") calls -> use model_script tool
-        if re.match(r'set\(\s*"(setup script|analysis script|script)"\s*,', code):
-            return {
-                'status': 'error',
-                'message': 'Do NOT use execute() to set scripts. Use model_script(action="set", ...) instead.'
-            }
+        # Guard: reject set("...script") anywhere in the code (single or double
+        # quotes) — script editing must go through model_script.
+        if re.search(r'\bset\(\s*[\'"]?(setup script|analysis script|script)[\'"]?\s*,', code):
+            raise BridgeError(
+                'Do NOT use execute() to set scripts. '
+                'Use model_script(action="set", ...) instead.')
 
         # ?expr: capture return value
         if code.startswith('?'):
@@ -181,8 +198,8 @@ class FdtdBridge(object):
                 func_name = m.group(1)
                 raw_args = m.group(2)
                 args = []
-                for a in re.findall(r'"([^"]*)"|\'([^\']*)\'|([^,]+)', raw_args):
-                    arg = a[0] or a[1] or a[2].strip()
+                for a in re.findall(r'"([^"]*)"|\'([^\']*)\'|([^,\s]+)', raw_args):
+                    arg = a[0] or a[1] or a[2]
                     try:
                         arg = float(arg)
                     except ValueError:
@@ -198,16 +215,18 @@ class FdtdBridge(object):
             return {'status': 'ok', 'result': self._sanitize(result)}
 
         # Transparent eval (NO parsing, NO splitting on semicolons)
+        if _RUN_COMMAND.search(code):
+            self._ensure_project_saved()
         try:
             self._fsp.eval(code)
             return {'status': 'ok'}
         except Exception as e:
-            raise RuntimeError(str(e)[:500])
+            raise BridgeError(str(e)[:_ERR_MSG])
 
     def _cmd_execute_file(self, p):
         """Run a .lsf script file."""
-        if not self._fsp:
-            raise RuntimeError('No open project')
+        self._require_project()
+        self._ensure_project_saved()  # the file may contain a run/runsweep command
         self._fsp.feval(p['path'])
         return {'status': 'ok'}
 
@@ -230,7 +249,6 @@ class FdtdBridge(object):
     def _traverse(self, scope, prop_list, enabled_only, result_list, seen):
         """Recurse into scope, appending discovered objects to result_list.
 
-        Shared between _cmd_get_scene_info and _cmd_get_model_overview.
         Always resets to ::model root before navigating to target scope.
         Uses _call_lsf for getid (avoids eval-assignment + getv pattern).
         """
@@ -276,26 +294,8 @@ class FdtdBridge(object):
             except Exception:
                 pass
 
-    def _cmd_get_scene_info(self, p):
-        if not self._fsp:
-            raise RuntimeError('No open project')
-        enabled_only = bool(p.get('enabled_only', False))
-
-        objects = []
-        seen = set()
-        self._traverse('::model', self._SCENE_PROPS, enabled_only, objects, seen)
-
-        fdtd = {}
-        for k in ['dimension','x span','y span','z span','simulation time','mesh accuracy']:
-            try:
-                fdtd[k] = self._fsp.getnamed('FDTD', k)
-            except Exception:
-                pass
-
-        return {'objects': objects, 'fdtd_summary': fdtd, 'object_count': len(objects)}
-
     # ------------------------------------------------------------------
-    # Model variables (P0-2) + Model overview (P0-1)
+    # Model variables + model overview
     # ------------------------------------------------------------------
 
     def _enum_model_variables(self, scope):
@@ -329,23 +329,13 @@ class FdtdBridge(object):
                 out[vn] = val
         return out
 
-    def _cmd_get_model_variables(self, p):
-        """Read GUI Model Variables table."""
-        if not self._fsp:
-            raise RuntimeError('No open project')
-        name = p.get('name', '::model')
-        variables = self._enum_model_variables(name)
-        return {'scope': name, 'variables': variables,
-                'count': len(variables)}
-
-    def _cmd_get_model_overview(self, p):
+    def _cmd_model_info(self, p):
         """One-call self-introspection: objects + variables + materials + FDTD summary.
 
         Designed to stop the LLM from skipping steps — everything needed for
         modeling + script writing in one dict. Scripts pulled separately via get_script.
         """
-        if not self._fsp:
-            raise RuntimeError('No open project')
+        self._require_project()
         enabled_only = bool(p.get('enabled_only', True))
         include_full = bool(p.get('include_full', False))
 
@@ -411,12 +401,11 @@ class FdtdBridge(object):
             return 'mode-source'
         return None
 
-    def _cmd_get_object_info(self, p):
+    def _cmd_model_get(self, p):
         """Get full properties of ONE named object with type discriminator.
         For groups and ::model, also returns scripts and variables.
         """
-        if not self._fsp:
-            raise RuntimeError('No open project')
+        self._require_project()
         name = self._resolve_name(p['name'])
         out = {'name': name}
         try:
@@ -427,7 +416,7 @@ class FdtdBridge(object):
             if sk:
                 out['source_kind'] = sk
         except Exception as e:
-            return {'name': name, 'error': 'not found', 'detail': str(e)[:200]}
+            raise BridgeError('Object not found: %s (%s)' % (name, str(e)[:_ERR_MSG]))
         for prop in self._SCENE_PROPS:
             try:
                 out[prop] = self._sanitize(
@@ -457,8 +446,7 @@ class FdtdBridge(object):
 
     def _cmd_model_add(self, p):
         """Add any object type to the model tree."""
-        if not self._fsp:
-            raise RuntimeError('No open project')
+        self._require_project()
         obj_type = p['type']
         name = p.get('name', None)
         properties = p.get('properties', {})
@@ -472,7 +460,7 @@ class FdtdBridge(object):
             'fdtd': 'addfdtd', 'mesh': 'addmesh',
             'dipole': 'adddipole', 'tfsf': 'addtfsf', 'plane': 'addplane',
             'gaussian': 'addgaussian', 'mode_source': 'addmode',
-            'power_monitor': 'addpower', 'dft_monitor': 'adddftmonitor',
+            'power_monitor': 'addpower', 'dft_monitor': 'addpower',
             'index_monitor': 'addindex', 'field_monitor': 'addfield',
             'movie_monitor': 'addmovie',
             'structure_group': 'addstructuregroup',
@@ -516,62 +504,92 @@ class FdtdBridge(object):
 
     def _cmd_model_delete(self, p):
         """Delete an object by name."""
-        if not self._fsp:
-            raise RuntimeError('No open project')
+        self._require_project()
         name = self._resolve_name(p['name'])
         self._fsp.eval('select("' + name + '"); delete();')
         return {'status': 'ok', 'deleted': name}
 
-    def _cmd_model_set(self, p):
-        """Set a property/parameter on an object, auto-handling different object types.
+    def _set_object_prop(self, obj, prop, value):
+        """Set one property on an object, handling ::model and groups.
 
-        Args:
-            name: target object name (default '::model')
-            property: property/parameter name (single)
-            value: new value (single)
-            properties: dict of property->value pairs (batch)
-        Supports old set_parameter convention (object + name) as well.
+        ::model         -> setnamed, falling back to addvar/setvar.
+        Analysis Group  -> setnamed, falling back to addanalysisprop.
+        Structure Group -> setnamed, falling back to adduserprop.
+        Anything else   -> setnamed directly.
+
+        Returns True if the property was set, False if every attempt failed
+        (e.g. the property does not exist on the object).
         """
-        if not self._fsp:
-            raise RuntimeError('No open project')
-        # Support batch mode via 'properties' dict
+        if obj == '::model':
+            for call in (('setnamed', obj, prop, value),
+                         ('addvar', obj, prop, value),
+                         ('setvar', obj, prop, value)):
+                try:
+                    self._call_lsf(*call)
+                    return True
+                except Exception:
+                    continue
+            return False
+        try:
+            obj_type = str(self._call_lsf('getnamed', obj, 'type'))
+        except Exception:
+            try:
+                self._call_lsf('setnamed', obj, prop, value)
+                return True
+            except Exception:
+                return False
+        if 'Analysis' in obj_type:
+            try:
+                self._call_lsf('setnamed', obj, prop, value)
+                return True
+            except Exception:
+                try:
+                    self._call_lsf('addanalysisprop', obj, prop)
+                    self._call_lsf('setnamed', obj, prop, value)
+                    return True
+                except Exception:
+                    return False
+        if 'Structure' in obj_type:
+            try:
+                self._call_lsf('setnamed', obj, prop, value)
+                return True
+            except Exception:
+                try:
+                    self._call_lsf('adduserprop', obj, prop)
+                    self._call_lsf('setnamed', obj, prop, value)
+                    return True
+                except Exception:
+                    return False
+        try:
+            self._call_lsf('setnamed', obj, prop, value)
+            return True
+        except Exception:
+            return False
+
+    def _cmd_model_set(self, p):
+        """Set properties on an object (batch via 'properties', or single via
+        'property'/'value'). Object type is auto-detected (see _set_object_prop).
+        """
+        self._require_project()
         if 'properties' in p:
             obj = self._resolve_name(p.get('name', '::model'))
-            props = p['properties']
             set_count = 0
-            for prop, value in props.items():
-                try:
-                    if obj == '::model':
-                        try:
-                            self._call_lsf('setnamed', obj, prop, value)
-                        except Exception:
-                            try:
-                                self._call_lsf('addvar', obj, prop, value)
-                            except Exception:
-                                self._call_lsf('setvar', obj, prop, value)
-                    else:
-                        try:
-                            obj_type = str(self._call_lsf('getnamed', obj, 'type'))
-                            if 'Analysis' in obj_type:
-                                try:
-                                    self._call_lsf('setnamed', obj, prop, value)
-                                except Exception:
-                                    self._call_lsf('addanalysisprop', obj, prop)
-                                    self._call_lsf('setnamed', obj, prop, value)
-                            elif 'Structure' in obj_type:
-                                try:
-                                    self._call_lsf('setnamed', obj, prop, value)
-                                except Exception:
-                                    self._call_lsf('adduserprop', obj, prop)
-                                    self._call_lsf('setnamed', obj, prop, value)
-                            else:
-                                self._call_lsf('setnamed', obj, prop, value)
-                        except Exception:
-                            self._call_lsf('setnamed', obj, prop, value)
+            failed = []
+            for prop, value in p['properties'].items():
+                if self._set_object_prop(obj, prop, value):
                     set_count += 1
-                except Exception:
-                    pass
-            return {'status': 'ok', 'object': obj, 'properties_set': set_count}
+                else:
+                    failed.append(prop)
+            result = {'status': 'ok', 'object': obj, 'properties_set': set_count}
+            if failed:
+                result['properties_failed'] = failed
+                result['hint'] = (
+                    'The failed properties likely do not exist on the object. '
+                    'Group/::model user properties must be declared in the object\'s '
+                    'script first (model_script), e.g. adduserprop("name", type_code, value). '
+                    'type_code is an integer: 0=number, 1=text, 2=length, 3=time, '
+                    '4=frequency, 5=material (addanalysisprop mirrors this).')
+            return result
         # Support both new API (name=object, property=prop) and old API (name=prop, object=target)
         if 'object' in p:
             obj = p['object']
@@ -580,37 +598,7 @@ class FdtdBridge(object):
             obj = p.get('name', '::model')
             prop = p.get('property', p.get('name'))
         value = p['value']
-
-        # Handle different object types
-        if obj == '::model':
-            # Try setnamed first, fall back to addvar/setvar
-            try:
-                self._call_lsf('setnamed', obj, prop, value)
-            except Exception:
-                try:
-                    self._call_lsf('addvar', obj, prop, value)
-                except Exception:
-                    self._call_lsf('setvar', obj, prop, value)
-        else:
-            try:
-                obj_type = str(self._call_lsf('getnamed', obj, 'type'))
-                if 'Analysis' in obj_type:
-                    try:
-                        self._call_lsf('setnamed', obj, prop, value)
-                    except Exception:
-                        self._call_lsf('addanalysisprop', obj, prop)
-                        self._call_lsf('setnamed', obj, prop, value)
-                elif 'Structure' in obj_type:
-                    try:
-                        self._call_lsf('setnamed', obj, prop, value)
-                    except Exception:
-                        self._call_lsf('adduserprop', obj, prop)
-                        self._call_lsf('setnamed', obj, prop, value)
-                else:
-                    self._call_lsf('setnamed', obj, prop, value)
-            except Exception:
-                self._call_lsf('setnamed', obj, prop, value)
-
+        self._set_object_prop(obj, prop, value)
         return {'status': 'ok', 'object': obj, 'property': prop, 'value': value}
 
     # ------------------------------------------------------------------
@@ -618,11 +606,10 @@ class FdtdBridge(object):
     # ------------------------------------------------------------------
 
     def _cmd_get_script(self, p):
-        if not self._fsp:
-            raise RuntimeError('No open project')
+        self._require_project()
         name = p.get('name', '::model')
         result = {}
-        self._fsp.select(name)
+        self._select_by_name(name)
 
         # ::model + Analysis Group have setup/analysis scripts.
         # Structure Group has a single 'script' property.
@@ -666,7 +653,7 @@ class FdtdBridge(object):
                 result[key] = content
             except Exception as e:
                 result[key] = None
-                result[key+'_error'] = str(e)[:200]
+                result[key+'_error'] = str(e)[:_ERR_MSG]
         return result
 
     def _cmd_set_script(self, p):
@@ -675,13 +662,12 @@ class FdtdBridge(object):
         ::model and Analysis Group use 'setup script' / 'analysis script'.
         Structure Group uses a single 'script' property.
         """
-        if not self._fsp:
-            raise RuntimeError('No open project')
+        self._require_project()
         name = p.get('name', '::model')
-        stype = p['type']  # 'setup' or 'analysis'
+        stype = p.get('script_type') or p.get('type')  # 'setup' or 'analysis'
         content = p['content']
 
-        self._fsp.select(name)
+        self._select_by_name(name)
         if name == '::model':
             script_prop = stype + ' script'
         else:
@@ -712,16 +698,16 @@ class FdtdBridge(object):
     # Sweep info
     # ------------------------------------------------------------------
 
-    def _cmd_get_sweep_info(self, p):
+    def _cmd_sweep_get(self, p):
         """Get sweep configuration."""
-        if not self._fsp:
-            raise RuntimeError('No open project')
+        self._require_project()
         name = p['name']
         info = {'name': name}
         try:
             result = self._call_lsf('getsweepresult', name)
+            info['exists'] = True
             info['has_results'] = True
-            info['result_sample'] = str(result)[:500] if result else 'empty'
+            info['result_sample'] = str(result)[:_ERR_MSG] if result else 'empty'
         except Exception as e:
             err = str(e)
             if 'no results' in err.lower():
@@ -730,42 +716,96 @@ class FdtdBridge(object):
                 info['note'] = 'Sweep defined but not yet run'
             else:
                 info['exists'] = False
-                info['error'] = err[:200]
+                info['error'] = err[:_ERR_MSG]
         return info
 
     # ------------------------------------------------------------------
-    # Sweep management (new)
+    # Sweep management
     # ------------------------------------------------------------------
+
+    def _sweep_param_struct(self, param):
+        """Build the Lumerical sweep-parameter struct from a tool param dict.
+
+        Verified against the real engine (v202): addsweepparameter takes a
+        struct with mixed-case keys (Name / parameter / type / start / stop);
+        lumapi's appCall converts a Python dict to that struct. 'points' is a
+        sweep-level property, not per-parameter.
+
+        NOTE: the per-parameter 'type' field is the parameter VALUE data type
+        (numeric code, or the string 'Number'), NOT the sampling type. The
+        tool's 'type':'Linear'/'Logarithmic' is the sampling intent — the
+        sweep samples start..stop with the sweep's number of points (Linear by
+        default) — so sampling strings are dropped and numeric/'Number' values
+        pass through.
+        """
+        s = {'Name': param.get('name')}
+        for key in ('parameter', 'start', 'stop'):
+            if key in param and param[key] is not None:
+                s[key] = param[key]
+        t = param.get('type')
+        if isinstance(t, int) and not isinstance(t, bool):
+            s['type'] = t
+        elif isinstance(t, str) and t.strip().lower() == 'number':
+            s['type'] = t.strip()
+        return s
+
+    def _sweep_result_struct(self, result):
+        s = {'Name': result.get('name')}
+        if result.get('result'):
+            s['Result'] = result['result']
+        return s
 
     def _cmd_sweep_add(self, p):
         """Add a new sweep with optional parameters and results."""
-        if not self._fsp:
-            raise RuntimeError('No open project')
+        self._require_project()
         sweep_type = p.get('type', 0)
         name = p.get('name', 'sweep')
         parameters = p.get('parameters', [])
         results = p.get('results', [])
 
-        # Create sweep
-        self._call_lsf('addsweep', sweep_type)
-        self._call_lsf('setsweep', 'sweep', 'name', name)
+        # addsweep returns the created sweep path (e.g. '::sweep', '::sweep1' —
+        # the auto-name increments when sweeps already exist). Sweeps are NOT
+        # model-tree objects: rename via the sweep API, not get/set on the
+        # selection (addsweep does not auto-select).
+        created_raw = self._call_lsf('addsweep', sweep_type)
+        created_name = str(created_raw).split('::')[-1] if created_raw else 'sweep'
+        if name:
+            self._call_lsf('setsweep', created_name, 'name', name)
 
-        # Configure parameters
+        param_errors = []
+        result_errors = []
         for param in parameters:
-            self._call_lsf('addsweepparameter', name, param)
+            if not isinstance(param, dict) or not param.get('name'):
+                param_errors.append('invalid parameter dict: ' + str(param))
+                continue
+            pname = param['name']
+            try:
+                self._call_lsf('addsweepparameter', name, self._sweep_param_struct(param))
+            except Exception as e:
+                param_errors.append(pname + ': add: ' + str(e)[:_ERR_MSG])
+            if param.get('points'):
+                try:
+                    self._call_lsf('setsweep', name, 'number of points', param['points'])
+                except Exception as e:
+                    param_errors.append(pname + '.points: ' + str(e)[:_ERR_MSG])
 
-        # Configure results
-        self._call_lsf('insertsweep', name)
         for result in results:
-            self._call_lsf('addsweepresult', name, result)
+            if not isinstance(result, dict) or not result.get('name'):
+                result_errors.append('invalid result dict: ' + str(result))
+                continue
+            rname = result['name']
+            try:
+                self._call_lsf('addsweepresult', name, self._sweep_result_struct(result))
+            except Exception as e:
+                result_errors.append(rname + ': add: ' + str(e)[:_ERR_MSG])
 
         return {'status': 'ok', 'name': name, 'type': sweep_type,
-                'parameter_count': len(parameters), 'result_count': len(results)}
+                'parameter_count': len(parameters), 'result_count': len(results),
+                'parameter_errors': param_errors, 'result_errors': result_errors}
 
     def _cmd_sweep_set(self, p):
         """Set sweep properties."""
-        if not self._fsp:
-            raise RuntimeError('No open project')
+        self._require_project()
         name = p['name']
         for prop, val in p.get('properties', {}).items():
             self._call_lsf('setsweep', name, prop, val)
@@ -773,8 +813,7 @@ class FdtdBridge(object):
 
     def _cmd_sweep_delete(self, p):
         """Delete a sweep by name."""
-        if not self._fsp:
-            raise RuntimeError('No open project')
+        self._require_project()
         self._call_lsf('deletesweep', p['name'])
         return {'status': 'ok', 'deleted': p['name']}
 
@@ -782,20 +821,19 @@ class FdtdBridge(object):
     # Materials
     # ------------------------------------------------------------------
 
-    def _cmd_add_material(self, p):
+    def _cmd_material_add(self, p):
         """Create a new material from a model type template.
 
         Args:
             type: material model type, e.g. 'Sampled 3D data', 'Dielectric', 'Drude'
         Returns the auto-generated material name.
         """
-        if not self._fsp:
-            raise RuntimeError('No open project')
+        self._require_project()
         mat_type = p.get('type', 'Sampled 3D data')
         name = self._call_lsf('addmaterial', mat_type)
         return {'status': 'ok', 'name': str(name), 'type': mat_type}
 
-    def _cmd_set_material(self, p):
+    def _cmd_material_set(self, p):
         """Set a material property.
 
         Args:
@@ -803,23 +841,21 @@ class FdtdBridge(object):
             property: property name, e.g. 'Refractive Index', 'nk data', 'mesh order'
             value: property value (number, string, or array for tabulated nk data)
         """
-        if not self._fsp:
-            raise RuntimeError('No open project')
+        self._require_project()
         name = p['name']
         prop = p['property']
         value = p['value']
         self._call_lsf('setmaterial', name, prop, value)
         return {'status': 'ok', 'name': name, 'property': prop}
 
-    def _cmd_get_material(self, p):
+    def _cmd_material_get(self, p):
         """Read material properties.
 
         Args:
             name: material name
             property: optional property name; if omitted, lists all property names
         """
-        if not self._fsp:
-            raise RuntimeError('No open project')
+        self._require_project()
         name = p['name']
         prop = p.get('property', None)
         if prop:
@@ -828,17 +864,15 @@ class FdtdBridge(object):
             result = self._call_lsf('getmaterial', name)
         return self._sanitize(result)
 
-    def _cmd_delete_material(self, p):
+    def _cmd_material_delete(self, p):
         """Delete a material by name."""
-        if not self._fsp:
-            raise RuntimeError('No open project')
+        self._require_project()
         self._call_lsf('deletematerial', p['name'])
         return {'status': 'ok', 'deleted': p['name']}
 
     def _cmd_material_exists(self, p):
         """Check if a material exists."""
-        if not self._fsp:
-            raise RuntimeError('No open project')
+        self._require_project()
         exists = self._call_lsf('materialexists', p['name'])
         return {'name': p['name'], 'exists': bool(exists)}
 
@@ -858,32 +892,21 @@ class FdtdBridge(object):
         'T_forward', 'T_backward', 'R_forward', 'R_backward',
     ]
 
-    def _cmd_get_results(self, p):
-        if not self._fsp:
-            raise RuntimeError('No open project')
-        name = p.get('name', 'FDTD')
-        try:
-            r = self._call_lsf('getresult', name)
-            return {'name': name, 'results': str(r).split('\n') if r else []}
-        except Exception as e:
-            return {'name': name, 'results': [], 'error': str(e)[:200]}
-
     def _cmd_result_list(self, p):
         """List result datasets AND probe field names in one call.
 
         Returns available result datasets for a monitor/object,
         with field names probed for each dataset.
         """
-        if not self._fsp:
-            raise RuntimeError('No open project')
-        name = p.get('name', 'FDTD')
+        self._require_project()
+        name = p.get('monitor') or p.get('name') or 'FDTD'
 
         # Get result datasets
         try:
             r = self._call_lsf('getresult', name)
             datasets = str(r).split('\n') if r else []
         except Exception as e:
-            return {'name': name, 'datasets': [], 'error': str(e)[:200]}
+            return {'name': name, 'datasets': [], 'error': str(e)[:_ERR_MSG]}
 
         # Probe fields for each dataset
         datasets_with_fields = []
@@ -892,16 +915,16 @@ class FdtdBridge(object):
             if not dataset:
                 continue
             try:
-                self._fsp.eval('_br_rl = getresult("' + name + '","' + dataset + '");')
+                self._fsp.eval('brrl = getresult("' + name + '","' + dataset + '");')
                 fields = []
                 for cf in self._COMMON_RESULT_FIELDS:
                     try:
-                        v = self._fsp.getv('_br_rl.' + cf)
+                        v = self._fsp.getv('brrl.' + cf)
                         if v is not None:
                             fields.append(cf)
                     except Exception:
                         pass
-                self._fsp.eval('clear(_br_rl);')
+                self._fsp.eval('clear(brrl);')
                 datasets_with_fields.append({'data': dataset, 'fields': fields,
                                              'field_count': len(fields)})
             except Exception:
@@ -911,43 +934,8 @@ class FdtdBridge(object):
         return {'monitor': name, 'datasets': datasets_with_fields,
                 'dataset_count': len(datasets_with_fields)}
 
-    def _cmd_list_result_fields(self, p):
-        """List field names in a result dataset WITHOUT fetching full data.
-
-        Probes common known field names via getv(dataset.field) to discover
-        which fields are accessible. Returns just the field names (no data)
-        so LLM can preview monitor structure before calling result_get.
-        """
-        if not self._fsp:
-            raise RuntimeError('No open project')
-        monitor = p['monitor']
-        data = p.get('data', '')
-        try:
-            if data:
-                self._fsp.eval('_br_lf = getresult("' + monitor + '","' + data + '");')
-            else:
-                self._fsp.eval('_br_lf = getresult("' + monitor + '");')
-            # Probe common field names to see which are accessible
-            present = []
-            for cf in self._COMMON_RESULT_FIELDS:
-                try:
-                    v = self._fsp.getv('_br_lf.' + cf)
-                    if v is not None:
-                        present.append(cf)
-                except Exception:
-                    pass
-            self._fsp.eval('clear(_br_lf);')
-            return {'monitor': monitor, 'data': data, 'fields': present,
-                    'count': len(present)}
-        except Exception as e:
-            return {'monitor': monitor, 'data': data,
-                    'error': str(e)[:300], 'fields': []}
-
     def _cmd_result_get(self, p):
         """Fetch result data for specific fields from a monitor.
-
-        Unlike get_result_data, this requires explicit 'fields' parameter
-        and only returns the requested fields (no auto-probing).
 
         Args:
             monitor: monitor name
@@ -955,8 +943,7 @@ class FdtdBridge(object):
             fields: list of field names to retrieve (REQUIRED)
             cap: max elements per field (default 2000)
         """
-        if not self._fsp:
-            raise RuntimeError('No open project')
+        self._require_project()
         monitor = p['monitor']
         data = p.get('data', '')
         fields = p.get('fields', None)
@@ -964,47 +951,52 @@ class FdtdBridge(object):
             raise RuntimeError('fields parameter is required. Use result_list first to discover available fields.')
         cap = int(p.get('cap', 2000))
 
-        # Load result
+        # Load result (Lumerical 2020 R2 rejects identifiers starting with
+        # '_', so temp vars must not be underscore-prefixed).
         if data:
-            self._fsp.eval('_br_d = getresult("' + monitor + '","' + data + '");')
+            self._fsp.eval('brd = getresult("' + monitor + '","' + data + '");')
         else:
-            self._fsp.eval('_br_d = getresult("' + monitor + '");')
+            self._fsp.eval('brd = getresult("' + monitor + '");')
 
         # Extract requested fields only
         values = {}
         truncated = {}
         for field in fields:
             try:
-                v = self._fsp.getv('_br_d.' + field)
+                v = self._fsp.getv('brd.' + field)
                 sanitized = self._sanitize(v, cap)
                 values[field] = sanitized
                 if isinstance(sanitized, dict) and sanitized.get('truncated'):
                     truncated[field] = sanitized.get('length')
             except Exception as e:
-                values[field] = {'error': str(e)[:200]}
+                values[field] = {'error': str(e)[:_ERR_MSG]}
 
-        self._fsp.eval('clear(_br_d);')
+        self._fsp.eval('clear(brd);')
         return {'monitor': monitor, 'data': data, 'values': values,
                 'fields_requested': fields, 'truncated': truncated}
 
-    def _cmd_get_result_file(self, p):
-        if not self._fsp:
-            raise RuntimeError('No open project')
-        monitor, data, out = p['monitor'], p.get('data', ''), p['output']
+    def _cmd_result_save(self, p):
+        self._require_project()
+        monitor, data = p['monitor'], p.get('data', '')
+        out = p.get('output')
+        if not out:
+            safe_mon = re.sub(r'[^\w.-]+', '_', monitor).strip('_') or 'monitor'
+            safe_data = re.sub(r'[^\w.-]+', '_', data or 'result').strip('_') or 'result'
+            out = os.path.join(self._tmp_dir,
+                               'result_%s_%s.mat' % (safe_mon, safe_data))
         try:
             ep = out.replace('\\', '\\\\')
-            self._fsp.eval('_br_d = getresult("' + monitor + '","' + data + '");')
-            self._fsp.eval('matlabsave("' + ep + '", _br_d);')
-            self._fsp.eval('clear(_br_d);')
+            self._fsp.eval('brd = getresult("' + monitor + '","' + data + '");')
+            self._fsp.eval('matlabsave("' + ep + '", brd);')
+            self._fsp.eval('clear(brd);')
             return {'file': out, 'status': 'ok'}
         except Exception as e:
-            return {'error': str(e)[:300]}
+            raise BridgeError('result_save failed: %s' % str(e)[:_ERR_MSG])
 
-    def _cmd_has_result(self, p):
+    def _cmd_result_has(self, p):
         """Check whether a monitor/element has results without throwing."""
-        if not self._fsp:
-            raise RuntimeError('No open project')
-        name = p['name']
+        self._require_project()
+        name = p.get('monitor') or p.get('name')
         # First try direct lumapi call (if it exists)
         for fn in ('haveresult', 'findresult', 'hasresult'):
             try:
@@ -1025,26 +1017,41 @@ class FdtdBridge(object):
     # Simulation
     # ------------------------------------------------------------------
 
+    def _ensure_project_saved(self):
+        """Save an unsaved project to a temp path before run().
+
+        Lumerical shows a modal 'Save As' dialog when running an unnamed
+        project; with a hidden instance that dialog is invisible and wedges the
+        solver. Giving the project a path first avoids the prompt entirely.
+        """
+        if not self._path:
+            self._path = os.path.join(
+                self._tmp_dir, '_mcp_auto_%d.fsp' % os.getpid())
+            self._fsp.save(self._path)
+        return self._path
+
     def _cmd_run(self, p):
-        if not self._fsp:
-            raise RuntimeError('No open project')
+        self._require_project()
+        self._ensure_project_saved()
         self._fsp.run()
-        return {'status': 'completed'}
+        return {'status': 'completed', 'saved_to': self._path}
 
-    def _cmd_run_sweep(self, p):
-        if not self._fsp:
-            raise RuntimeError('No open project')
+    def _cmd_sweep_run(self, p):
+        self._require_project()
+        self._ensure_project_saved()
         self._fsp.runsweep(p['name'])
-        return {'status': 'completed'}
+        return {'status': 'completed', 'saved_to': self._path}
 
-    def _cmd_get_sweep_result(self, p):
-        if not self._fsp:
-            raise RuntimeError('No open project')
+    def _cmd_sweep_result(self, p):
+        self._require_project()
         try:
-            r = self._call_lsf('getsweepresult', p['name'])
+            if p.get('result'):
+                r = self._call_lsf('getsweepresult', p['name'], p['result'])
+            else:
+                r = self._call_lsf('getsweepresult', p['name'])
             return self._sanitize(r)
         except Exception as e:
-            return {'error': str(e)[:300]}
+            raise BridgeError('sweep_result failed: %s' % str(e)[:_ERR_MSG])
 
     # ------------------------------------------------------------------
     # Helpers
@@ -1088,8 +1095,13 @@ class FdtdBridge(object):
             converted.append(a)
         return appCall(self._fsp, func_name, converted)
 
-    def _sanitize(self, value, cap=1000):
-        """Sanitize values for JSON serialization, preserving array shape and truncation info."""
+    def _sanitize(self, value, cap=_TRUNC):
+        """Sanitize values for JSON serialization.
+
+        Preserves ndarray shape for small arrays (nested lists), represents
+        complex values as [re, im] pairs (instead of '(1.5+0.001j)' strings),
+        and reports shape/length/truncation for large arrays.
+        """
         if value is None:
             return None
         if isinstance(value, (bool, int)):
@@ -1110,28 +1122,43 @@ class FdtdBridge(object):
         try:
             import numpy as np
             if isinstance(value, np.ndarray):
-                flat = value.flatten()
-                total = len(flat)
-                truncated = total > cap
-                data = flat[:cap].tolist() if truncated else flat.tolist()
-                result = {'data': data, 'shape': list(value.shape), 'length': total}
-                if truncated:
-                    result['truncated'] = True
-                return result
+                if value.size <= cap:
+                    data = value.tolist()
+                    if value.dtype.kind == 'c':
+                        data = self._complex_to_lists(data)
+                    return {'data': data, 'shape': list(value.shape),
+                            'length': value.size}
+                flat = value.flatten()[:cap]
+                if flat.dtype.kind == 'c':
+                    data = [[float(v.real), float(v.imag)] for v in flat.tolist()]
+                else:
+                    data = flat.tolist()
+                return {'data': data, 'shape': list(value.shape),
+                        'length': value.size, 'truncated': True}
         except ImportError:
             pass
         try:
             return float(value)
         except (TypeError, ValueError):
             pass
+        if isinstance(value, complex):
+            return [value.real, value.imag]
         s = str(value)
         return s[:10000] if len(s) > 10000 else s
+
+    def _complex_to_lists(self, data):
+        """Recursively convert Python complex numbers to [re, im] pairs."""
+        if isinstance(data, complex):
+            return [data.real, data.imag]
+        if isinstance(data, list):
+            return [self._complex_to_lists(v) for v in data]
+        return data
 
     def _ok(self, rid, result):
         return {'id': rid, 'result': result}
 
     def _error(self, rid, message):
-        return {'id': rid, 'error': {'code': -1, 'message': message[:2000]}}
+        return {'id': rid, 'error': {'code': -1, 'message': message[:_ERR_MSG]}}
 
 
 def main():
@@ -1149,7 +1176,7 @@ def main():
             sys.stdout.flush()
             continue
         if request.get('method') == 'shutdown':
-            bridge._cmd_close({})
+            bridge._cmd_session_close({})
             break
         resp = bridge.handle(request)
         sys.stdout.write(json.dumps(resp, default=str) + '\n')

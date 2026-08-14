@@ -85,10 +85,46 @@ If auto-detection fails, add the `--lumerical-home` argument:
 
 ### DeepSeek Harness (DSH)
 
-This repository ships a standard DSH bundle plugin under `dsh-plugin/` that bridges
-this MCP server into DeepSeek Harness through the official
-`@deepseek-ai/dsh-mcp-client` plugin; the tools are exposed to DSH as `mcp__fdtd__*`.
-Install, uninstall, and configuration instructions: **[DSH_PLUGIN.md](DSH_PLUGIN.md)**.
+The MCP server is bridged into DSH through its official plugin
+`@deepseek-ai/dsh-mcp-client` (ships with every `dsh` install). Tools are exposed
+to DSH as `mcp__fdtd__*` (e.g. `mcp__fdtd__execute`, `mcp__fdtd__run`,
+`mcp__fdtd__model_add`; 30 tools total).
+
+**Registration steps:**
+
+1. Open the web profile's user patch layer `$DSH_HOME/profiles/web/cordis.patch.yml`
+   (`$DSH_HOME` defaults to `C:\Users\<you>\.dsh`) and append to the top-level array:
+
+```yaml
+- insert:
+    - id: mcp-fdtd
+      name: '@deepseek-ai/dsh-mcp-client'
+      config:
+        serverName: fdtd
+        transport: stdio
+        command: D:/coding/anaconda3/python.exe   # ← your Python ≥3.10 (with the mcp package)
+        args: ['-m', 'fdtd_mcp.server']
+        env:
+          PYTHONPATH: D:/project/fdtd-mcp          # ← your checkout; can be removed after pip install .
+        cwd: D:/project/fdtd-mcp                   # ← same
+        failOnStartupError: false                  # skip tool registration, never block GUI boot
+```
+
+2. **No Lumerical path configuration needed**: the server auto-detects it
+   (`--lumerical-home` arg > `LUMERICAL_HOME` env var > scanning common install
+   directories, newest version wins). For non-standard installs, change `args` to
+   `['-m', 'fdtd_mcp.server', '--lumerical-home', '<your-path>']` or set the
+   `LUMERICAL_HOME` environment variable. Do NOT hardcode a nonexistent
+   `LUMERICAL_HOME` in the plugin config — the server trusts it without
+   validation and auto-detection would be short-circuited.
+3. The profile patch layer is watched live by DSH, so a restart is usually **not
+   needed**; if the tools do not appear, restart `dsh web`.
+4. Verify with `dsh web --dump-config` — the output should contain the `mcp-fdtd` row.
+
+For other profiles (e.g. headless), add the same snippet to
+`$DSH_HOME/profiles/<name>/cordis.patch.yml`, or to the home-level
+`$DSH_HOME/cordis.patch.yml` which applies to every profile. This integration does
+not affect the Claude Code `.mcp.json` registration.
 
 ## Tools (30 tools, 6 modules)
 

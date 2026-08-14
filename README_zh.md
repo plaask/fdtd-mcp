@@ -85,9 +85,42 @@ claude mcp add fdtd -- python -m fdtd_mcp.server
 
 ### DeepSeek Harness（DSH）
 
-本仓库附带一个标准 DSH bundle 插件包 `dsh-plugin/`，通过 DSH 官方的
-`@deepseek-ai/dsh-mcp-client` 桥接本 MCP 服务器，工具以 `mcp__fdtd__*` 形式供 DSH
-调用。安装/卸载/配置说明见 **[DSH_PLUGIN.md](DSH_PLUGIN.md)**。
+通过 DSH 官方插件 `@deepseek-ai/dsh-mcp-client`（随每个 `dsh` 安装自带）桥接本
+MCP 服务器，工具以 `mcp__fdtd__*` 形式供 DSH 调用（如 `mcp__fdtd__execute`、
+`mcp__fdtd__run`、`mcp__fdtd__model_add`，共 30 个）。
+
+**注册步骤：**
+
+1. 打开 DSH web profile 的用户补丁层 `$DSH_HOME/profiles/web/cordis.patch.yml`
+   （`$DSH_HOME` 默认是 `C:\Users\<你>\.dsh`），在顶层数组中追加：
+
+```yaml
+- insert:
+    - id: mcp-fdtd
+      name: '@deepseek-ai/dsh-mcp-client'
+      config:
+        serverName: fdtd
+        transport: stdio
+        command: D:/coding/anaconda3/python.exe   # ← 改成你的 Python ≥3.10（需装有 mcp 包）
+        args: ['-m', 'fdtd_mcp.server']
+        env:
+          PYTHONPATH: D:/project/fdtd-mcp          # ← 改成你的仓库目录；若已 pip install . 可删掉
+        cwd: D:/project/fdtd-mcp                   # ← 同上
+        failOnStartupError: false                  # Lumerical 未就绪时只跳过工具注册，不影响 GUI 启动
+```
+
+2. **Lumerical 路径无需配置**：服务器自动发现（`--lumerical-home` 参数 >
+   `LUMERICAL_HOME` 环境变量 > 常见安装目录扫描，取最新版本）。非标准安装可把
+   `args` 改成 `['-m', 'fdtd_mcp.server', '--lumerical-home', '<你的路径>']`，
+   或直接设置 `LUMERICAL_HOME` 环境变量。注意不要给插件配置写死一个不存在的
+   `LUMERICAL_HOME`——服务器对它不做有效性检查，会短路自动发现。
+3. profile 补丁层会被 DSH 实时监视，一般**无需重启**；若工具未出现，重启
+   `dsh web`。
+4. 验证：`dsh web --dump-config`，确认输出中是否含 `mcp-fdtd` 行。
+
+其他 profile（如 headless）把同一片段加进
+`$DSH_HOME/profiles/<name>/cordis.patch.yml`，或加到对所有 profile 生效的
+`$DSH_HOME/cordis.patch.yml` 即可。此集成与 Claude Code 的 `.mcp.json` 互不影响。
 
 ## 工具（30 个，6 个模块）
 

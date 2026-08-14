@@ -1,0 +1,23 @@
+{
+  "name": "fdtd-mcp-dsh-plugin",
+  "version": "0.1.0",
+  "description": "DSH bundle plugin: bridges the fdtd-mcp server (Lumerical FDTD simulation) into DeepSeek Harness via @deepseek-ai/dsh-mcp-client.",
+  "private": true,
+  "type": "module",
+  "exports": {
+    "./cordis.patch.yml": "./cordis.patch.yml",
+    "./package.json": "./package.json"
+  },
+  "files": [
+    "cordis.patch.yml"
+  ],
+  "license": "MIT",
+  "dsh": {
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    }
+  },
+  "dependencies": {
+    "@deepseek-ai/dsh-mcp-client": "^0.1.0-rc.6"
+  }
+}

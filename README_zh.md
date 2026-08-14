@@ -83,6 +83,12 @@ claude mcp add fdtd -- python -m fdtd_mcp.server
 }
 ```
 
+### DeepSeek Harness（DSH）
+
+本仓库附带一个标准 DSH bundle 插件包 `dsh-plugin/`，通过 DSH 官方的
+`@deepseek-ai/dsh-mcp-client` 桥接本 MCP 服务器，工具以 `mcp__fdtd__*` 形式供 DSH
+调用。安装/卸载/配置说明见 **[DSH_PLUGIN.md](DSH_PLUGIN.md)**。
+
 ## 工具（30 个，6 个模块）
 
 ```

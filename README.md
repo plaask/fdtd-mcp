@@ -83,6 +83,13 @@ If auto-detection fails, add the `--lumerical-home` argument:
 }
 ```
 
+### DeepSeek Harness (DSH)
+
+This repository ships a standard DSH bundle plugin under `dsh-plugin/` that bridges
+this MCP server into DeepSeek Harness through the official
+`@deepseek-ai/dsh-mcp-client` plugin; the tools are exposed to DSH as `mcp__fdtd__*`.
+Install, uninstall, and configuration instructions: **[DSH_PLUGIN.md](DSH_PLUGIN.md)**.
+
 ## Tools (30 tools, 6 modules)
 
 ```

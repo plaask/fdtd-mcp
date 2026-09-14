@@ -1,5 +1,5 @@
 {
-  "_server_only": ["reference_lookup"],
+  "_server_only": ["reference_lookup", "engine_cleanup", "library_list"],
   "session_open": "session_open",
   "session_new": "session_new",
   "session_close": "session_close",
@@ -11,6 +11,7 @@
   "model_set": "model_set",
   "model_delete": "model_delete",
   "model_script": "model_script",
+  "library_insert": "library_insert",
   "material_add": "material_add",
   "material_get": "material_get",
   "material_set": "material_set",
@@ -28,5 +29,6 @@
   "result_has": "result_has",
   "run": "run",
   "execute": "execute",
-  "execute_file": "execute_file"
+  "execute_file": "execute_file",
+  "engine_status": "engine_status"
 }

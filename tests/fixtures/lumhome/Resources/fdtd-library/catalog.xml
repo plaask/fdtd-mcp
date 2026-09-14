@@ -1,0 +1,43 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!-- Minimal stand-in for <LUMERICAL_HOME>/Resources/fdtd-library/catalog.xml,
+     used by tests/test_library.py. Mirrors the real schema (simObject with
+     id / categoryName / type / shortDescription / projectFileUrl) and includes
+     one entry whose .fsp is deliberately absent, so the "installed" flag is
+     covered. -->
+<simObjectCatalog>
+	<version>1.0</version>
+	<categories>
+		<category><name>Resonators and modal analysis</name></category>
+		<category><name>Integrated optics</name></category>
+	</categories>
+	<simObject>
+		<id>Qanalysis</id>
+		<categoryName>Resonators and modal analysis</categoryName>
+		<type>Analysis</type>
+		<shortDescription>An analysis group that measures the Q factor of a resonator.</shortDescription>
+		<thumbnailUrl>thumbs/Qanalysis.png</thumbnailUrl>
+		<imageUrl>Qanalysis.png</imageUrl>
+		<projectFileUrl>Qanalysis.fsp</projectFileUrl>
+	</simObject>
+	<simObject>
+		<id>ring_resonator</id>
+		<categoryName>Integrated optics</categoryName>
+		<type>Structures</type>
+		<shortDescription>Ring resonator with four waveguides.</shortDescription>
+		<projectFileUrl>ring_resonator.fsp</projectFileUrl>
+	</simObject>
+	<simObject>
+		<id>ghost_item</id>
+		<categoryName>Integrated optics</categoryName>
+		<type>Structures</type>
+		<shortDescription>Catalog entry whose project file is missing.</shortDescription>
+		<projectFileUrl>ghost_item.fsp</projectFileUrl>
+	</simObject>
+	<simObject>
+		<id>sphere</id>
+		<categoryName>Uncategorized structures</categoryName>
+		<type>Structures</type>
+		<shortDescription>An analytic sphere — a library item that is a primitive, not a group.</shortDescription>
+		<projectFileUrl>sphere.fsp</projectFileUrl>
+	</simObject>
+</simObjectCatalog>

@@ -64,6 +64,27 @@ def test_ndarray_complex_becomes_re_im():
     assert out['data'] == [[1.0, 2.0], [3.0, 4.0]]
 
 
+def test_uninitialised_imaginary_noise_reads_as_zero():
+    """v202 leaves the imaginary half of real matrices uninitialised.
+
+    Reading "sampled 3d data" back yields imaginary parts like 6.2e-307 (memory
+    noise). They must not surface as if the data were corrupted.
+    """
+    s = _bridge()
+    import numpy as np
+    arr = np.array([[3e-7 + 0j, 1.52 + 6.230420704259778e-307j],
+                    [4.5e-7 + 0j, 1.5 + 4.227952691948946e-307j]])
+    out = s._sanitize(arr)
+    assert out['data'] == [[[3e-07, 0.0], [1.52, 0.0]],
+                           [[4.5e-07, 0.0], [1.5, 0.0]]]
+
+
+def test_real_imaginary_parts_are_kept():
+    """The noise floor must not hide physically meaningful loss."""
+    s = _bridge()
+    assert s._sanitize(1.5 + 0.001j) == [1.5, 0.001]
+
+
 def test_ndarray_large_truncates():
     s = _bridge()
     import numpy as np

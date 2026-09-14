@@ -68,30 +68,38 @@ def _split_args(s):
     return args
 
 
+def _unescape(text):
+    """Undo LSF string escaping (\\" and \\\\) inside a captured literal."""
+    out = []
+    i = 0
+    while i < len(text):
+        ch = text[i]
+        if ch == '\\' and i + 1 < len(text) and text[i + 1] in '\\"\'':
+            out.append(text[i + 1])
+            i += 2
+            continue
+        out.append(ch)
+        i += 1
+    return ''.join(out)
+
+
 def _token_value(tok):
-    """Turn a parsed argument token into a str/float/None."""
+    """Turn a parsed argument token into a str/int/float/None.
+
+    Integer-looking literals stay ints (LSF literals are typed, and commands
+    such as addanalysisprop reject a float type code).
+    """
     tok = tok.strip()
     if len(tok) >= 2 and tok[0] == '"' and tok[-1] == '"':
         return tok[1:-1]
     if len(tok) >= 2 and tok[0] == "'" and tok[-1] == "'":
         return tok[1:-1]
+    if re.match(r'^[+-]?\d+$', tok):
+        return int(tok)
     try:
         return float(tok)
     except ValueError:
         return tok
-
-
-def _repr_lsf(v):
-    """Best-effort LSF literal representation (used for addvar lines)."""
-    if v is None:
-        return '0'
-    if isinstance(v, str):
-        return '"%s"' % v
-    if hasattr(v, 'tolist'):
-        v = v.tolist()
-    if isinstance(v, (list, tuple)):
-        return repr(list(v))
-    return repr(v)
 
 
 # ---------------------------------------------------------------------------
@@ -102,7 +110,17 @@ class _Obj(object):
     def __init__(self, type_str):
         self.type = type_str
         self.props = {}
+        self.prop_types = {}       # user properties (adduserprop)
+        self.analysis_props = {}   # analysis properties (addanalysisprop)
+        self.analysis_results = []  # addanalysisresult names
         self.scope = '::model'
+
+
+def _suffixed(name):
+    """v202's rename-on-collision rule: gap -> gap2 -> gap3."""
+    base = name.rstrip('0123456789')
+    digits = name[len(base):]
+    return '%s%d' % (base or name, int(digits) + 1 if digits else 2)
 
 
 class FakeFDTD(object):
@@ -126,7 +144,6 @@ class FakeFDTD(object):
         'addmode': ('Mode Source', 'mode'),
         'addpower': ('Power Monitor', 'power'),
         'addindex': ('Index Monitor', 'index'),
-        'addfield': ('Field Monitor', 'field'),
         'addmovie': ('Movie Monitor', 'movie'),
         'addstructuregroup': ('Structure Group', 'structuregroup'),
         'addanalysisgroup': ('Analysis Group', 'analysisgroup'),
@@ -134,10 +151,26 @@ class FakeFDTD(object):
     MONITOR_TYPES = ('Power Monitor', 'DFT Monitor', 'Index Monitor',
                      'Field Monitor', 'Movie Monitor')
 
+    # v202 fidelity for addobject(): object-library items come from
+    # <LUMERICAL_HOME>/Resources/fdtd-library and are copied in by id, then the
+    # item's setup script re-runs (which is what creates the child objects).
+    # The fake reproduces the three shapes the real library has: a structure
+    # group with children, an analysis group with generated monitors, and a bare
+    # primitive. An unknown id is silently ignored — the real engine does not
+    # raise either, which is why library_insert validates against catalog.xml.
+    LIBRARY = {
+        'ring_resonator': ('Structure Group', 'ring resonator',
+                           ['outer_top', 'outer_bottom', 'inner_top',
+                            'inner_bottom', 'arc1', 'arc2', 'arc3', 'arc4']),
+        'Qanalysis': ('Analysis Group', 'Qanalysis',
+                      ['t1', 't2', 't3', 't4']),
+        'sphere': ('Sphere', 'sphere', []),
+    }
+
     def __init__(self, *a, **k):
         self._objects = {}
-        self._model = _Obj('Model')
-        self._model.props['type'] = 'Model'
+        self._model = _Obj('ObjectModelRoot')
+        self._model.props['type'] = 'ObjectModelRoot'
         self._model.props['setup script'] = ''
         self._model.props['analysis script'] = ''
         self._selected = None
@@ -203,6 +236,9 @@ class FakeFDTD(object):
             p['x span'] = 1e-6
             p['y span'] = 1e-6
             p['z span'] = 1e-6
+            # Present but inactive until the override toggle is switched on.
+            p['override mesh order from material database'] = False
+            p['override color opacity from material database'] = False
         if t in ('Dipole', 'TFSF', 'Plane Wave', 'Gaussian', 'Mode Source'):
             p['amplitude'] = 1.0
             p['polarization angle'] = 0.0
@@ -267,6 +303,11 @@ class FakeFDTD(object):
 
     def close(self):
         self._closed = True
+        # Observable side effect for the EOF test: when the MCP server goes away
+        # the bridge must still close the session before exiting, otherwise the
+        # (real) engine process is orphaned. stderr is captured by the caller.
+        sys.stderr.write('fake-engine: close() called\n')
+        sys.stderr.flush()
 
     def getnamed(self, name, prop):
         """Direct-method form used by session_new/open and model_info."""
@@ -301,7 +342,13 @@ class FakeFDTD(object):
 
     def eval(self, code):
         self._eval_log.append(code)
-        for stmt in _split_statements(code):
+        # v202 fidelity: '#' starts a comment and runs to end of line; '%' is
+        # NOT a comment there — a '%' line makes the script fail outright.
+        for line in code.split('\n'):
+            if line.strip().startswith('%'):
+                raise RuntimeError('Failed to evaluate code')
+        stripped = '\n'.join(line.split('#', 1)[0] for line in code.split('\n'))
+        for stmt in _split_statements(stripped):
             s = stmt.strip()
             if not s:
                 continue
@@ -348,10 +395,10 @@ class FakeFDTD(object):
             return True
         if s.startswith('selectall'):
             return True
-        # select("...")
-        m = re.match(r'select\s*\(\s*"([^"]*)"\s*\)\s*$', s)
+        # select("...") — quotes inside the name arrive backslash-escaped.
+        m = re.match(r'select\s*\(\s*"((?:[^"\\]|\\.)*)"\s*\)\s*$', s)
         if m:
-            self.select(m.group(1))
+            self.select(_unescape(m.group(1)))
             return True
         if re.match(r'delete\s*\(\s*\)\s*$', s):
             self._delete_selected()
@@ -451,12 +498,17 @@ class FakeFDTD(object):
         if func_name == 'setnamed':
             target, prop, value = args[0], args[1], args[2]
             obj = self._resolve(target)
-            if target == '::model' and prop not in ('type', 'setup script',
-                                                    'analysis script'):
-                line = 'addvar("%s", %s)' % (prop, _repr_lsf(value))
-                if line not in obj.props.get('setup script', ''):
-                    obj.props['setup script'] = obj.props.get('setup script', '') \
-                        + line + '\n'
+            # v202 fidelity: setnamed can only UPDATE an existing property. It
+            # cannot create one ("in setnamed, the requested property was not
+            # found") — the old fake silently created model variables here,
+            # which hid the fact that addvar is gone from v202.
+            if prop not in obj.props:
+                raise KeyError('in setnamed, the requested property was not found')
+            # v202 fidelity: a property that sits behind an "override ..."
+            # toggle reports itself as inactive rather than missing.
+            if prop == 'mesh order' and not obj.props.get(
+                    'override mesh order from material database'):
+                raise RuntimeError('in setnamed, the requested property is inactive')
             obj.props[prop] = value
             return None
 
@@ -506,30 +558,105 @@ class FakeFDTD(object):
             self._create_object(func_name)
             return None
 
-        if func_name in ('addvar', 'setvar'):
-            if len(args) == 3:
-                target, prop, value = args
-            elif len(args) == 2:
-                target, prop = args
-                value = None
-            else:
-                raise TypeError('addvar/setvar expects 2 or 3 args')
-            obj = self._resolve(target)
-            obj.props[prop] = value
-            if target == '::model' and prop not in ('type', 'setup script',
-                                                    'analysis script'):
-                line = 'addvar("%s", %s)' % (prop, _repr_lsf(value))
-                if line not in obj.props.get('setup script', ''):
-                    obj.props['setup script'] = obj.props.get('setup script', '') \
-                        + line + '\n'
+        if func_name == 'addobject':
+            if len(args) != 1:
+                raise RuntimeError('argument list for addobject command is incorrect')
+            spec = self.LIBRARY.get(str(args[0]))
+            if spec is None:
+                return None            # real engine: unknown id is a silent no-op
+            type_str, name, children = spec
+            obj = _Obj(type_str)
+            obj.scope = self._scope
+            obj.props['name'] = name
+            obj.props['enabled'] = True
+            self._apply_defaults(obj)
+            if type_str == 'Structure Group':
+                obj.props['script'] = ('addwaveguide; set("name","outer_top");\n'
+                                       '# library setup script (fake)')
+            elif type_str == 'Analysis Group':
+                obj.props['setup script'] = ('addtime; set("name","t1");\n'
+                                             '# library setup script (fake)')
+                obj.props['analysis script'] = '# library analysis script (fake)'
+            self._objects[name] = obj
+            for child in children:
+                kid = _Obj('Waveguide' if type_str == 'Structure Group'
+                           else 'TimeMonitor')
+                kid.scope = '%s::%s' % (self._scope, name)
+                kid.props['name'] = child
+                kid.props['enabled'] = True
+                self._apply_defaults(kid)
+                self._objects['%s::%s' % (name, child)] = kid
+            self._selected = name
             return None
 
+        # v202 fidelity: addvar/setvar/getvar were removed from the LSF command
+        # table. The fake must NOT emulate them, or tests certify a dead API.
+        if func_name in ('addvar', 'setvar', 'getvar', 'addvarfdtd'):
+            raise RuntimeError(func_name + ' is not a valid function or variable name')
+
         if func_name in ('adduserprop', 'addanalysisprop'):
-            target, prop = args[0], args[1]
-            obj = self._resolve(target)
-            if prop not in obj.props:
-                obj.props[prop] = None
+            # Real signature: adduserprop("name", type_code, value) — it acts on
+            # the CURRENTLY SELECTED object and only accepts an INTEGER type code.
+            if len(args) != 3:
+                raise RuntimeError(
+                    'argument list for %s command is incorrect' % func_name)
+            prop, type_code, value = args[0], args[1], args[2]
+            if not isinstance(type_code, int) or isinstance(type_code, bool) \
+                    or not 0 <= type_code <= 5:
+                raise RuntimeError(
+                    'argument list for %s command is incorrect - type must be '
+                    'the INTEGER code 0-5' % func_name)
+            obj = self._selected_object()
+            # v202: the model root and analysis groups are edited by the
+            # "Edit analysis group" dialog, so their Analysis > Variables table
+            # lists ANALYSIS properties; structure groups take user properties.
+            if func_name == 'addanalysisprop':
+                allowed = ('::model', 'ObjectModelRoot', 'Analysis Group')
+                store = obj.analysis_props
+            else:
+                allowed = ('Structure Group',)
+                store = obj.prop_types
+            if obj.type not in allowed:
+                raise RuntimeError(
+                    '%s requires a single structure or analysis group object '
+                    'to be selected' % func_name)
+            # v202: the namespaces share names and the call is NOT idempotent —
+            # declaring an existing name silently creates a suffixed clone.
+            name = prop
+            while name in obj.props:
+                name = _suffixed(name)
+            store[name] = type_code
+            obj.props[name] = value
             return None
+
+        if func_name == 'addanalysisresult':
+            # v202: exactly one argument (name) on the model root.
+            if len(args) != 1:
+                raise RuntimeError(
+                    'argument list for addanalysisresult command is incorrect')
+            obj = self._selected_object()
+            if obj.type not in ('::model', 'ObjectModelRoot', 'Analysis Group'):
+                raise RuntimeError('addanalysisresult requires an analysis '
+                                   'group object to be selected')
+            if args[0] not in obj.analysis_results:
+                obj.analysis_results.append(args[0])
+            return None
+
+        if func_name == 'queryanalysisresult':
+            obj = self._resolve(args[0])
+            return list(obj.analysis_results)
+
+        if func_name == 'queryuserprop':
+            obj = self._selected_object()
+            if obj.type not in ('::model', 'ObjectModelRoot', 'Structure Group'):
+                raise RuntimeError('NULL pointer access')
+            return {'name': list(obj.prop_types.keys()),
+                    'type': [str(v) for v in obj.prop_types.values()]}
+
+        if func_name == 'queryanalysisprop':
+            obj = self._resolve(args[0])
+            return {'name': list(obj.analysis_props.keys()),
+                    'type': [str(v) for v in obj.analysis_props.values()]}
 
         # ---- materials ----
         if func_name == 'addmaterial':
@@ -659,7 +786,21 @@ class FakeFDTD(object):
             return ds[dataset]
 
         if func_name in ('haveresult', 'findresult', 'hasresult'):
+            if func_name != 'haveresult':
+                # v202 fidelity: only haveresult exists as a script command.
+                raise RuntimeError(
+                    func_name + ' is not a valid function or variable name')
             return bool(self._results.get(args[0]))
+
+        # LSF `run;` / `runsweep("name");` are the script forms of the same
+        # operations the bridge also calls through the project handle.
+        if func_name == 'run':
+            self.run()
+            return None
+
+        if func_name == 'runsweep':
+            self.runsweep(args[0])
+            return None
 
         self._eval_log.append('FAKE-UNSUPPORTED: %s%r' % (func_name, args))
         raise RuntimeError('FakeEngine: unsupported function: %s' % func_name)

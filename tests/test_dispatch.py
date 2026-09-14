@@ -30,27 +30,40 @@ def _load_dispatch():
 
 
 def _tool_names_from_server():
-    src = (PKG / 'server.py').read_text(encoding='utf-8')
+    """Tool names now live in the declarative spec table (fdtd_mcp/toolspec.py)."""
+    src = (PKG / 'toolspec.py').read_text(encoding='utf-8')
     tree = ast.parse(src)
     for node in tree.body:
         if isinstance(node, ast.Assign) and any(
-                isinstance(t, ast.Name) and t.id == 'TOOLS'
+                isinstance(t, ast.Name) and t.id == 'SPECS'
                 for t in node.targets):
             names = []
-            assert isinstance(node.value, ast.List), 'TOOLS is not a list'
+            assert isinstance(node.value, ast.List), 'SPECS is not a list'
             for item in node.value.elts:
                 for kw in item.keywords:
                     if kw.arg == 'name' and isinstance(kw.value, ast.Constant):
                         names.append(kw.value.value)
             return names
-    raise AssertionError('TOOLS list not found in server.py')
+    raise AssertionError('SPECS list not found in toolspec.py')
 
 
 def _bridge_handlers():
-    src = (PKG / 'bridge.py').read_text(encoding='utf-8')
-    tree = ast.parse(src)
-    return {n.name for n in ast.walk(tree)
-            if isinstance(n, ast.FunctionDef) and n.name.startswith('_cmd_')}
+    """Every `_cmd_*` handler in the bridge package.
+
+    The bridge was split into engine/ + handlers/ mix-ins, so handlers are no
+    longer only in bridge.py — scan the whole package.
+    """
+    srcs = [PKG / 'bridge.py']
+    for sub in ('handlers', 'engine'):
+        d = PKG / sub
+        if d.is_dir():
+            srcs.extend(sorted(d.glob('*.py')))
+    names = set()
+    for path in srcs:
+        tree = ast.parse(path.read_text(encoding='utf-8'))
+        names.update(n.name for n in ast.walk(tree)
+                     if isinstance(n, ast.FunctionDef) and n.name.startswith('_cmd_'))
+    return names
 
 
 def test_every_tool_has_dispatch_entry():

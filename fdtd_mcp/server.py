@@ -1,6 +1,5 @@
 # -*- coding: utf-8 -*-
-"""
-FDTD MCP Server — 30 tools, 6 modules covering full FDTD workflow.
+"""FDTD MCP Server — Lumerical FDTD automation over MCP stdio.
 
 Architecture:
   AI Assistant --MCP stdio--> server.py (system Python >=3.10)
@@ -8,8 +7,16 @@ Architecture:
                              bridge.py (Lumerical embed Python 3.6.8)
                                 | lumapi
                              Lumerical FDTD engine
+
+Sources of truth (deliberately only three, and they are cross-checked):
+  * fdtd_mcp/toolspec.py   — every tool's schema, description, annotations,
+                             defaults and timeout class (the MCP surface),
+  * fdtd_mcp/dispatch.json — tool -> bridge method, shared with the bridge,
+  * fdtd_mcp/bridge.py + engine/ + handlers/ — the behaviour itself.
+tests/test_dispatch.py, tests/test_toolspec.py and tests/test_capability_guard.py
+fail when those disagree, so no second hand-maintained table can drift.
 """
-import sys, os, json, subprocess, threading, re, queue, logging
+import sys, os, json, hashlib, subprocess, threading, re, queue, logging
 import anyio
 from collections import deque
 from typing import Any
@@ -17,7 +24,14 @@ from mcp import types
 from mcp.server import Server
 from mcp.server.stdio import stdio_server
 from .discovery import find_lumerical, find_lumerical_python
+from .engine import proctree
+from .engine import library
+from .toolspec import SPECS, spec_by_name, visible_specs
+from .engine.capabilities import DEAD_COMMANDS, VERIFIED_AGAINST
 
+# ---------------------------------------------------------------------------
+# Timeouts
+# ---------------------------------------------------------------------------
 # Per-call timeout (seconds). OFF by default so legitimate long simulations are
 # never killed mid-run. Set FDTD_MCP_CALL_TIMEOUT (or pass timeout= on a single
 # call to run/sweep_run/execute/execute_file) to bound a call: on expiry the
@@ -33,6 +47,14 @@ try:
             _CALL_TIMEOUT = None
 except ValueError:
     pass
+
+# Launching/closing a hidden engine can block for minutes (license checkout, an
+# invisible modal dialog). Bounding it turns a 9-minute silent hang into a fast,
+# diagnosable error. Override with FDTD_MCP_LAUNCH_TIMEOUT (0 disables).
+try:
+    _LAUNCH_TIMEOUT = float(os.environ.get('FDTD_MCP_LAUNCH_TIMEOUT', '300') or 300)
+except ValueError:
+    _LAUNCH_TIMEOUT = 300.0
 
 # ---- Bundled lumapi ref data (server-side only) ----
 _CHEATSHEET_PATH = os.path.join(os.path.dirname(__file__), 'cheatsheet', 'lumapi_ref.json')
@@ -73,7 +95,30 @@ def _get_lumerical_home():
 
 LUMERICAL_HOME = _get_lumerical_home()
 LUMERICAL_PYTHON = find_lumerical_python(LUMERICAL_HOME)
-BRIDGE_SCRIPT = os.path.join(os.path.dirname(__file__), 'bridge.py')
+_PACKAGE_DIR = os.path.dirname(os.path.abspath(__file__))
+# Command used to spawn the bridge. Kept as one overridable list so tests can
+# point the client at a fake bridge process.
+BRIDGE_ARGS = [LUMERICAL_PYTHON, '-m', 'fdtd_mcp.bridge',
+               '--lumerical-home', LUMERICAL_HOME]
+
+
+def _code_id(*paths):
+    """Short fingerprint of a set of files (for staleness diagnostics)."""
+    h = hashlib.sha1()
+    for path in paths:
+        if os.path.isfile(path):
+            h.update(os.path.basename(path).encode('utf-8'))
+            with open(path, 'rb') as f:
+                h.update(f.read())
+    return h.hexdigest()[:12]
+
+
+_SERVER_CODE_ID = _code_id(
+    os.path.join(_PACKAGE_DIR, 'server.py'),
+    os.path.join(_PACKAGE_DIR, 'toolspec.py'),
+    _DISPATCH_PATH,
+    _CHEATSHEET_PATH,
+)
 
 
 class BridgeClient(object):
@@ -82,6 +127,10 @@ class BridgeClient(object):
     stdout is drained by a background reader thread into a queue so calls never
     block the event loop and EOF (crash) is detected immediately. stderr is
     drained by a separate thread to avoid a full pipe-buffer deadlock.
+    Responses are correlated by request id: a line that does not carry our id
+    (engine chatter, a malformed request echo, a late reply) is kept for
+    diagnostics instead of being mistaken for the answer, which used to shift
+    every later response by one.
     """
 
     def __init__(self):
@@ -91,6 +140,9 @@ class BridgeClient(object):
         self._resp_queue = None
         self._dead = False
         self._stderr_lines = deque(maxlen=200)
+        self._unsolicited = deque(maxlen=50)
+        self._ever_started = False
+        self._restart_notice = None
 
     def is_dead(self):
         if self._dead or self._proc is None:
@@ -101,32 +153,49 @@ class BridgeClient(object):
         env = os.environ.copy()
         env['PATH'] = LUMERICAL_HOME + os.pathsep + env.get('PATH', '')
         env['PYTHONIOENCODING'] = 'utf-8'
+        # The bridge lives in this package, so make sure the repo root is
+        # importable no matter how the server itself was started.
+        root = os.path.dirname(_PACKAGE_DIR)
+        env['PYTHONPATH'] = root + os.pathsep + env.get('PYTHONPATH', '')
         self._proc = subprocess.Popen(
-            [LUMERICAL_PYTHON, BRIDGE_SCRIPT, '--lumerical-home', LUMERICAL_HOME],
+            list(BRIDGE_ARGS),
             stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-            env=env, text=True, encoding='utf-8')
+            env=env, cwd=root, text=True, encoding='utf-8')
         self._dead = False
         self._resp_queue = queue.Queue()
         threading.Thread(target=self._read_loop, daemon=True,
                          name='bridge-reader').start()
         threading.Thread(target=self._stderr_loop, daemon=True,
                          name='bridge-stderr').start()
-        try:
-            line = self._resp_queue.get(timeout=30)
-        except queue.Empty:
-            self._dead = True
-            raise RuntimeError('Bridge failed to send ready handshake')
-        if line is None:
-            self._dead = True
-            raise RuntimeError('Bridge closed before ready handshake')
-        try:
-            ready = json.loads(line)
-        except (ValueError, TypeError):
-            self._dead = True
-            raise RuntimeError('Bridge failed to start: bad handshake')
-        if not (isinstance(ready, dict) and ready.get('ready')):
-            self._dead = True
-            raise RuntimeError('Bridge failed to start')
+        self._handshake()
+        if self._ever_started:
+            self._restart_notice = (
+                'The bridge/engine process was restarted, so any unsaved '
+                'in-memory engine state is gone. Reopen the project with '
+                'session_open if needed.')
+        self._ever_started = True
+
+    def _handshake(self, timeout=30):
+        """Wait for the bridge's ready line, tolerating other output."""
+        deadline = timeout
+        while True:
+            try:
+                line = self._resp_queue.get(timeout=deadline)
+            except queue.Empty:
+                self._dead = True
+                raise RuntimeError('Bridge failed to send ready handshake')
+            if line is None:
+                self._dead = True
+                raise RuntimeError('Bridge closed before ready handshake')
+            try:
+                ready = json.loads(line)
+            except (ValueError, TypeError):
+                self._unsolicited.append(line.strip()[:200])
+                continue
+            if isinstance(ready, dict) and ready.get('ready'):
+                self.bridge_code_id = ready.get('code_id')
+                return ready
+            self._unsolicited.append(json.dumps(ready)[:200])
 
     def _read_loop(self):
         try:
@@ -134,12 +203,17 @@ class BridgeClient(object):
                 line = self._proc.stdout.readline()
                 if not line:
                     break
-                self._resp_queue.put(line)
+                q = self._resp_queue
+                if q is None:      # stop() already tore the queue down
+                    break
+                q.put(line)
         except Exception:
             pass
         finally:
             self._dead = True
-            self._resp_queue.put(None)  # EOF sentinel (responses are never None)
+            q = self._resp_queue
+            if q is not None:
+                q.put(None)        # EOF sentinel (responses are never None)
 
     def _stderr_loop(self):
         try:
@@ -153,6 +227,14 @@ class BridgeClient(object):
 
     def stderr_tail(self):
         return list(self._stderr_lines)
+
+    def unsolicited(self):
+        return list(self._unsolicited)
+
+    def take_restart_notice(self):
+        """Return (and clear) the one-shot 'the engine restarted' warning."""
+        notice, self._restart_notice = self._restart_notice, None
+        return notice
 
     def stop(self):
         proc = self._proc
@@ -177,10 +259,10 @@ class BridgeClient(object):
         try:
             proc.wait(timeout=5)
         except Exception:
-            try:
-                proc.kill()
-            except Exception:
-                pass
+            # Never leave the engine behind: taskkill /T takes the whole tree
+            # (bridge python + its fdtd-solutions.exe child), proc.kill() would
+            # only take the python and orphan the engine.
+            self._kill_bridge_tree()
         self._proc = None
         self._resp_queue = None
 
@@ -189,35 +271,26 @@ class BridgeClient(object):
             return self._call(method, params or {}, timeout)
 
     def _kill_bridge_tree(self):
-        """Kill the bridge and its children (taskkill /T) so a wedged run()
-        does not leave an orphaned fdtd-solutions solver process behind."""
+        """Kill the bridge and its children so a wedged run() does not leave an
+        orphaned fdtd-solutions solver process behind.
+
+        Goes through proctree (TerminateProcess) rather than the taskkill
+        binary: taskkill can be refused by an outer sandbox/policy, and a silent
+        failure here is one of the ways engines get orphaned.
+        """
         proc = self._proc
         if proc is None:
             return
         try:
-            subprocess.run(
-                ['taskkill', '/PID', str(proc.pid), '/T', '/F'],
-                capture_output=True, timeout=15)
+            proctree.kill_pid(proc.pid, tree=True)
         except Exception:
-            pass
-        try:
-            proc.kill()
-        except Exception:
-            pass
+            try:
+                proc.kill()
+            except Exception:
+                pass
 
-    def _call(self, method, params, timeout=None):
-        if timeout is None:
-            timeout = _CALL_TIMEOUT  # resolve global at call time
-        if self._dead or self._proc is None:
-            raise RuntimeError('Bridge is not running')
-        self._req_id += 1
-        try:
-            self._proc.stdin.write(json.dumps(
-                {'id': self._req_id, 'method': method, 'params': params}) + '\n')
-            self._proc.stdin.flush()
-        except Exception as e:
-            self._dead = True
-            raise RuntimeError('Bridge write failed: ' + str(e))
+    def _next_line(self, timeout):
+        """Read one stdout line, or raise on timeout / EOF."""
         try:
             if timeout:
                 line = self._resp_queue.get(timeout=timeout)
@@ -230,13 +303,31 @@ class BridgeClient(object):
             self._dead = True
             self._kill_bridge_tree()
             raise RuntimeError(
-                'Bridge call timed out after %.0fs (FDTD_MCP_CALL_TIMEOUT). '
-                'The bridge was killed and will auto-restart; reopen your '
-                'project if the engine state was lost.' % (timeout or 0))
+                'Bridge call timed out after %.0fs. The bridge was killed and '
+                'will auto-restart; reopen your project if the engine state was '
+                'lost. (bounds: FDTD_MCP_CALL_TIMEOUT / FDTD_MCP_LAUNCH_TIMEOUT)'
+                % (timeout or 0))
         if line is None:
             self._dead = True
             raise RuntimeError('Bridge closed')
-        resp = json.loads(line)
+        return line
+
+    def _call(self, method, params, timeout=None):
+        if timeout is None:
+            timeout = _CALL_TIMEOUT  # resolve global at call time
+        if self._dead or self._proc is None:
+            raise RuntimeError('Bridge is not running')
+        self._req_id += 1
+        req_id = self._req_id
+        try:
+            self._proc.stdin.write(json.dumps(
+                {'id': req_id, 'method': method, 'params': params}) + '\n')
+            self._proc.stdin.flush()
+        except Exception as e:
+            self._dead = True
+            raise RuntimeError('Bridge write failed: ' + str(e))
+
+        resp = self._await_response(req_id, timeout)
         if 'error' in resp:
             msg = resp['error'].get('message', str(resp['error']))
             if 'Traceback' in msg:
@@ -244,497 +335,141 @@ class BridgeClient(object):
             raise RuntimeError(msg)
         return resp.get('result')
 
+    def _await_response(self, req_id, timeout):
+        """Return the response carrying `req_id`, ignoring unrelated lines."""
+        while True:
+            line = self._next_line(timeout)
+            try:
+                resp = json.loads(line)
+            except (ValueError, TypeError):
+                self._unsolicited.append(line.strip()[:200])
+                continue
+            if not isinstance(resp, dict):
+                self._unsolicited.append(str(resp)[:200])
+                continue
+            if resp.get('id') != req_id:
+                # Not ours: engine chatter, a stray echo, or a late reply for a
+                # call that already timed out. Never treat it as the answer.
+                self._unsolicited.append(json.dumps(resp)[:200])
+                logging.debug('[bridge] unsolicited response: %s', resp)
+                continue
+            return resp
+
+
 _bridge = BridgeClient()
 
-# ---- 30 tools / 6 modules ----
-# Each description embeds correct invocation patterns and common pitfalls.
+# ---- Orphaned engine processes -------------------------------------------
+# fdtd-solutions.exe is a CHILD of the bridge python, and Windows kills nothing
+# when a parent dies. Two paths therefore orphan it: the bridge being killed
+# without /T, and the MCP server being recycled while a project is open (the
+# bridge sees EOF and exits). An orphan keeps an ANSYS license seat and a few
+# hundred MB, and no client can ever reach it again — so it is always safe to
+# kill. Engines of a live foreign process (the Lumerical GUI) are never touched.
+_ORPHAN_SWEEP = os.environ.get('FDTD_MCP_ORPHAN_SWEEP', '1').lower() not in (
+    '0', 'false', 'no', 'off')
+_orphan_sweep_report = None
+_orphan_sweep_lock = threading.Lock()
 
-TOOLS = [
-    # ==================================================================
-    # Module: session (5 tools)
-    # ==================================================================
-    types.Tool(name='session_open',
-        description=(
-            'Open a Lumerical FDTD project file (.fsp).\n'
-            'Always call this first to load an existing project.\n'
-            '\n'
-            'Example:\n'
-            '  session_open(path="C:/projects/my_sim.fsp")'
-        ),
-        inputSchema={'type':'object','properties':{
-            'path':{'type':'string','description':'Path to .fsp file'}},
-            'required':['path']}),
-    types.Tool(name='session_new',
-        description=(
-            'Create a new blank FDTD project (no .fsp file needed).\n'
-            'Optionally set FDTD region properties.\n'
-            '\n'
-            'Example:\n'
-            '  session_new(dimension="3D", x_span=2e-6, y_span=2e-6, z_span=1e-6, mesh_accuracy=4)'
-        ),
-        inputSchema={'type':'object','properties':{
-            'dimension':{'type':'string','description':'2D or 3D'},
-            'x_span':{'type':'number'},'y_span':{'type':'number'},'z_span':{'type':'number'},
-            'simulation_time':{'type':'number'},'mesh_accuracy':{'type':'number'}}}),
-    types.Tool(name='session_close',
-        description='Close the currently open FDTD project.',
-        inputSchema={'type':'object','properties':{}}),
-    types.Tool(name='session_save',
-        description=(
-            'Save the current project.\n'
-            'If path is omitted, overwrites the current file (if previously saved).\n'
-            '\n'
-            'Examples:\n'
-            '  session_save()                                  -> overwrite current file\n'
-            '  session_save(path="C:/projects/my_sim.fsp")    -> save as new path'
-        ),
-        inputSchema={'type':'object','properties':{
-            'path':{'type':'string','description':'Output .fsp path (optional, omit to overwrite current)'}}}),
-    types.Tool(name='session_save_as',
-        description=(
-            'Save the current project with a new path.\n'
-            '\n'
-            'Example:\n'
-            '  session_save_as(path="C:/projects/my_sim_v2.fsp")'
-        ),
-        inputSchema={'type':'object','properties':{
-            'path':{'type':'string','description':'Output .fsp path'}},
-            'required':['path']}),
 
-    # ==================================================================
-    # Module: model (6 tools)
-    # ==================================================================
-    types.Tool(name='model_info',
-        description=(
-            'ONE-CALL model self-introspection: object tree (recursive), materials list, '
-            'model variables, FDTD summary, result names.\n'
-            'Merges scene info + model overview + variables into a single result.\n'
-            '\n'
-            'Call this FIRST after opening/creating a project, and BEFORE you:\n'
-            '  - Make assumptions about object types\n'
-            '  - Use variable names not yet verified\n'
-            '  - Assign materials to objects\n'
-            '\n'
-            'Disabled objects FILTERED OUT by default (enabled_only=true).\n'
-            'Set include_full=true to get full per-object properties (slower, larger response).'
-        ),
-        inputSchema={'type':'object','properties':{
-            'enabled_only':{'type':'boolean','description':'Skip disabled objects (default true)'},
-            'include_full':{'type':'boolean','description':'Also return full per-object props (default false)'}}}),
-    types.Tool(name='model_add',
-        description=(
-            'Add ANY object to the model tree.\n'
-            '\n'
-            'Supported types:\n'
-            '  rectangle, circle, ring, polygon, sphere, pyramid, triangle, waveguide\n'
-            '  fdtd, mesh\n'
-            '  dipole, tfsf, plane, gaussian, mode_source\n'
-            '  power_monitor, dft_monitor, index_monitor, field_monitor, movie_monitor\n'
-            '  structure_group, analysis_group\n'
-            '\n'
-            'Examples:\n'
-            '  model_add(type="rectangle", name="my_rect",\n'
-            '    properties={"x span": 1e-6, "y span": 2e-6})\n'
-            '  model_add(type="dipole", properties={"x": 0, "y": 0, "z": 0})\n'
-            '\n'
-            'If name is omitted, Lumerical auto-generates one.\n'
-            'Use scope="::model" (default) to add at root level.'
-        ),
-        inputSchema={'type':'object','properties':{
-            'type':{'type':'string','description':'Object type to create',
-                'enum':['rectangle','circle','ring','polygon','sphere','pyramid','triangle',
-                        'waveguide','fdtd','mesh','dipole','tfsf','plane','gaussian',
-                        'mode_source','power_monitor','dft_monitor','index_monitor',
-                        'field_monitor','movie_monitor','structure_group','analysis_group']},
-            'name':{'type':'string','description':'Optional name (auto-generated if omitted)'},
-            'properties':{'type':'object','description':'Optional property dict to set after creation'},
-            'scope':{'type':'string','description':'Parent scope, default "::model"'}},
-            'required':['type']}),
-    types.Tool(name='model_get',
-        description=(
-            'Get full info for ONE named object: all properties, scripts (if group/::model),\n'
-            'variables (if group/::model), children (if group).\n'
-            '\n'
-            'Example:\n'
-            '  model_get(name="source_1")\n'
-            '    -> {type: "Dipole", amplitude: 1.0, ...}'
-        ),
-        inputSchema={'type':'object','properties':{
-            'name':{'type':'string','description':'Object name (required)'}},
-            'required':['name']}),
-    types.Tool(name='model_set',
-        description=(
-            'Set properties/variables on an object.\n'
-            'For "::model": uses addvar/setvar for new properties.\n'
-            'For groups: uses adduserprop/addanalysisprop.\n'
-            'For ordinary objects: uses setnamed directly.\n'
-            '\n'
-            'Examples:\n'
-            '  model_set(name="my_rect", properties={"x span": 2e-6, "y span": 1e-6})\n'
-            '  model_set(name="::model", properties={"gap": 200e-9})'
-        ),
-        inputSchema={'type':'object','properties':{
-            'name':{'type':'string','description':'Object name'},
-            'properties':{'type':'object','description':'Dict of property=value pairs'}},
-            'required':['name','properties']}),
-    types.Tool(name='model_delete',
-        description=(
-            'Delete an object from the model tree by name.\n'
-            '\n'
-            'Example:\n'
-            '  model_delete(name="my_rect")'
-        ),
-        inputSchema={'type':'object','properties':{
-            'name':{'type':'string','description':'Object name to delete'}},
-            'required':['name']}),
-    types.Tool(name='model_script',
-        description=(
-            'Get or set scripts on objects with script properties.\n'
-            '\n'
-            'Actions:\n'
-            '  action="get"  -> return current script text\n'
-            '  action="set"  -> write new script content\n'
-            '\n'
-            'Script property names depend on object TYPE (auto-detected):\n'
-            '  ::model          -> "setup script" / "analysis script"\n'
-            '  Analysis Group   -> "setup script" / "analysis script"\n'
-            '  Structure Group  -> "script"\n'
-            '\n'
-            'Examples:\n'
-            '  model_script(name="::model", action="get")\n'
-            '  model_script(name="Cnorm", action="get")\n'
-            '  model_script(name="Cnorm", action="set", content="...new script...")\n'
-            '  model_script(name="my_struct", action="set", script_type="script", content="...")\n'
-            '\n'
-            'IMPORTANT: Always use this tool for scripts. '
-            'Do NOT use execute(\'set("setup script",...)\').'
-        ),
-        inputSchema={'type':'object','properties':{
-            'name':{'type':'string','description':'Object name, default "::model"'},
-            'action':{'type':'string','description':'"get" or "set"'},
-            'script_type':{'type':'string','description':'"setup", "analysis", or "script" (auto-detected if omitted)'},
-            'content':{'type':'string','description':'Script text (required for action="set")'}},
-            'required':['name','action']}),
+def _sweep_orphan_engines(force=False):
+    """Kill engines whose parent process is gone. Idempotent, never raises."""
+    global _orphan_sweep_report
+    with _orphan_sweep_lock:
+        if _orphan_sweep_report is not None and not force:
+            return _orphan_sweep_report
+        if not _ORPHAN_SWEEP:
+            _orphan_sweep_report = {'enabled': False,
+                                    'note': 'set FDTD_MCP_ORPHAN_SWEEP=1 to enable'}
+            return _orphan_sweep_report
+        try:
+            report = proctree.sweep_orphans()
+        except Exception as e:                      # diagnostics only
+            report = {'error': str(e)[:300]}
+        _orphan_sweep_report = report
+        return report
 
-    # ==================================================================
-    # Module: material (5 tools)
-    # ==================================================================
-    types.Tool(name='material_add',
-        description=(
-            'Create a new material from a model type template.\n'
-            'Returns the auto-generated material NAME.\n'
-            '\n'
-            'Common types:\n'
-            '  "Sampled 3D data"  -> tabulated nk data (use for polymers like PNIPAM)\n'
-            '  "Dielectric"       -> constant refractive index\n'
-            '  "Drude"            -> metal Drude model\n'
-            '\n'
-            'Workflow:\n'
-            '  1. material_add(type="Sampled 3D data")  -> returns name like "material_1"\n'
-            '  2. material_set(name="material_1", property="sampled 3d data", value=[[...]])\n'
-            '  3. model_set(name="my_rect", properties={"material": "material_1"})\n'
-            '\n'
-            'Tip: Built-in database materials (e.g. "Au (Gold) - Johnson and Christy")\n'
-            'need NO material_add -- just assign the name string via model_set.'
-        ),
-        inputSchema={'type':'object','properties':{
-            'type':{'type':'string','description':'Material model type, default "Sampled 3D data"'}}}),
-    types.Tool(name='material_get',
-        description=(
-            'Read material properties.\n'
-            'If property is omitted, lists all available property names for the material.\n'
-            '\n'
-            'Examples:\n'
-            '  material_get(name="material_1")                   -> list all property names\n'
-            '  material_get(name="material_1", property="sampled 3d data")  -> return data'
-        ),
-        inputSchema={'type':'object','properties':{
-            'name':{'type':'string'},'property':{'type':'string','description':'Optional property name to read'}},
-            'required':['name']}),
-    types.Tool(name='material_set',
-        description=(
-            'Set a material property.\n'
-            '\n'
-            'Correct property names (depends on material type -- check with material_get first):\n'
-            '  "sampled 3d data"  -> Nx2/3 array [[wl,n,ik],...] for Sampled 3D data\n'
-            '  "Refractive Index" -> constant n (for Dielectric type)\n'
-            '  "mesh order"       -> mesh priority override\n'
-            '  "name"            -> rename the material\n'
-            '  "color"           -> RGBA color\n'
-            '\n'
-            'Data format for sampled materials:\n'
-            '  Nx2 array: [[wl1, n1+ik1], [wl2, n2+ik2], ...]\n'
-            '  or [[freq1, eps1], [freq2, eps2], ...]\n'
-            '\n'
-            'Examples:\n'
-            '  material_set(name="mat1", property="Refractive Index", value=1.5)\n'
-            '  material_set(name="mat1", property="mesh order", value=2)\n'
-            '  material_set(name="mat1", property="sampled 3d data",\n'
-            '    value=[[300e-9,1.5,0],[800e-9,1.5,0]])\n'
-            '\n'
-            'For large nk datasets, prefer file import:\n'
-            '  execute(\'importnk("C:/path/to/nk_data.txt")\')\n'
-            'Tip: Call material_get(name) WITHOUT property first to see all settable property names.'
-        ),
-        inputSchema={'type':'object','properties':{
-            'name':{'type':'string'},'property':{'type':'string'},'value':{'description':'Property value: number, string, or numeric array'}},
-            'required':['name','property','value']}),
-    types.Tool(name='material_delete',
-        description=(
-            'Delete a material from the database.\n'
-            '\n'
-            'Example:\n'
-            '  material_delete(name="material_1")'
-        ),
-        inputSchema={'type':'object','properties':{
-            'name':{'type':'string'}}, 'required':['name']}),
-    types.Tool(name='material_exists',
-        description=(
-            'Check if a material exists in the database.\n'
-            '\n'
-            'Example:\n'
-            '  material_exists(name="Au (Gold) - Johnson and Christy") -> {exists: true}'
-        ),
-        inputSchema={'type':'object','properties':{
-            'name':{'type':'string'}}, 'required':['name']}),
 
-    # ==================================================================
-    # Module: sweep (6 tools)
-    # ==================================================================
-    types.Tool(name='sweep_add',
-        description=(
-            'Create and configure a parameter sweep.\n'
-            '\n'
-            'Types: 0=parameter sweep, 1=optimization, 2=monte carlo, 3=s-parameter\n'
-            '\n'
-            'Parameter dicts use keys: name, parameter (the object property path to\n'
-            'sweep, e.g. "::model::substrate::z span" — use "::" separators, NOT ">":\n'
-            '"::model>gap" registers but does NOT resolve at runtime), start, stop,\n'
-            'and points (number of sample points; applied at the sweep level).\n'
-            'Sampling is Linear by default — do NOT set a per-parameter "type" sampling\n'
-            'string; "type" is the parameter VALUE data type and should be omitted\n'
-            '(or "Number"). Model variables (addvar) are gone in v202 — sweep a real\n'
-            'object property instead.\n'
-            '\n'
-            'Example:\n'
-            '  sweep_add(name="thickness_sweep", type=0,\n'
-            '    parameters=[{"name":"t","parameter":"::model::substrate::z span",\n'
-            '                 "start":100e-9,"stop":300e-9,"points":5}],\n'
-            '    results=[{"name":"T","result":"::model::transmission_calc::T"}])'
-        ),
-        inputSchema={'type':'object','properties':{
-            'type':{'type':'integer','description':'Sweep type: 0=parameter, 1=optimization, 2=monte carlo, 3=s-parameter (default 0)'},
-            'name':{'type':'string','description':'Sweep name'},
-            'parameters':{'type':'array','items':{'type':'object'},'description':'List of parameter dicts: {name, parameter, start, stop, points}'},
-            'results':{'type':'array','items':{'type':'object'},'description':'List of result dicts: {name, result}'}},
-            'required':['type','name']}),
-    types.Tool(name='sweep_get',
-        description=(
-            'Get parameter sweep configuration.\n'
-            'Tells you: whether the sweep exists, has results, and result structure.\n'
-            '\n'
-            'Example:\n'
-            '  sweep_get(name="gap_sweep") -> {exists: true, has_results: false, note: "not yet run"}'
-        ),
-        inputSchema={'type':'object','properties':{
-            'name':{'type':'string','description':'Sweep name'}},
-            'required':['name']}),
-    types.Tool(name='sweep_set',
-        description=(
-            'Modify sweep properties.\n'
-            '\n'
-            'Example:\n'
-            '  sweep_set(name="gap_sweep", properties={"sweep type": 0})'
-        ),
-        inputSchema={'type':'object','properties':{
-            'name':{'type':'string','description':'Sweep name'},
-            'properties':{'type':'object','description':'Dict of property=value pairs'}},
-            'required':['name','properties']}),
-    types.Tool(name='sweep_delete',
-        description=(
-            'Delete a sweep by name.\n'
-            '\n'
-            'Example:\n'
-            '  sweep_delete(name="gap_sweep")'
-        ),
-        inputSchema={'type':'object','properties':{
-            'name':{'type':'string'}}, 'required':['name']}),
-    types.Tool(name='sweep_run',
-        description=(
-            'Run a parameter sweep by name. Blocks until completion.\n'
-            'timeout (seconds) bounds the wait; on expiry the engine is '
-            'restarted (set 0 to wait forever, default from FDTD_MCP_CALL_TIMEOUT).\n'
-            '\n'
-            'Example:\n'
-            '  sweep_run(name="gap_sweep")'
-        ),
-        inputSchema={'type':'object','properties':{
-            'name':{'type':'string'},
-            'timeout':{'type':'number','description':'Optional wait bound in seconds (0 = no timeout)'}},
-            'required':['name']}),
-    types.Tool(name='sweep_result',
-        description=(
-            'Get results from a completed parameter sweep.\n'
-            '\n'
-            'Examples:\n'
-            '  sweep_result(name="gap_sweep")                 -> all results\n'
-            '  sweep_result(name="gap_sweep", result="T")    -> specific result'
-        ),
-        inputSchema={'type':'object','properties':{
-            'name':{'type':'string'},'result':{'type':'string','description':'Optional result name'}},
-            'required':['name']}),
+def _engine_process_status():
+    """Engine-process picture for engine_status (works with a dead bridge)."""
+    bridge_pid = None
+    proc = getattr(_bridge, '_proc', None)
+    if proc is not None and not _bridge.is_dead():
+        bridge_pid = proc.pid
+    try:
+        inv = proctree.inventory(bridge_pid=bridge_pid)
+    except Exception as e:
+        return {'error': str(e)[:300]}
+    return {
+        'server_pid': inv['own_pid'],
+        'bridge_pid': bridge_pid,
+        'counts': inv['counts'],
+        'bridge_engine_pids': [i['pid'] for i in inv['bridge']],
+        'orphan_pids': [i['pid'] for i in inv['orphans']],
+        'foreign_pids': [i['pid'] for i in inv['foreign']],
+        'notes': {
+            'bridge': "the live session's engine (child of this server's bridge)"
+                      ' — freed by closing or restarting the session',
+            'orphan': 'parent process is gone — unreachable, holds a license seat, safe to kill',
+            'foreign': 'engine of another LIVE client (e.g. the Lumerical GUI) — never killed',
+        },
+        'swept_at_start': _orphan_sweep_report,
+    }
 
-    # ==================================================================
-    # Module: result (4 tools)
-    # ==================================================================
-    types.Tool(name='result_list',
-        description=(
-            'List available results/data for a monitor, or list all monitors with results.\n'
-            '\n'
-            'Examples:\n'
-            '  result_list()                          -> list all monitors with results\n'
-            '  result_list(monitor="DFT")             -> list datasets on DFT monitor\n'
-            '  result_list(monitor="DFT", data="E")   -> list field names in E dataset\n'
-            '\n'
-            'Call this BEFORE result_get to discover available field names.'
-        ),
-        inputSchema={'type':'object','properties':{
-            'monitor':{'type':'string','description':'Monitor name (optional)'},
-            'data':{'type':'string','description':'Dataset name, e.g. "E", "T" (optional)'}}}),
-    types.Tool(name='result_get',
-        description=(
-            'Get result data from a monitor. Fields parameter is REQUIRED.\n'
-            'Call result_list FIRST to discover available field names.\n'
-            '\n'
-            'Returns {fields_available: [...], values: {field: array}}.\n'
-            'Common fields: Ex, Ey, Ez, Hx, Hy, Hz, x, y, z, T, R, P, power, f, lambda\n'
-            '\n'
-            'Examples:\n'
-            '  result_get(monitor="DFT", fields=["Ex","Ey","f","lambda"])\n'
-            '  result_get(monitor="::model", data="g_lum", fields=["lambda","T"])\n'
-            '\n'
-            'Arrays are capped per-field at cap (default 2000) -- '
-            'use result_save for full .mat export.'
-        ),
-        inputSchema={'type':'object','properties':{
-            'monitor':{'type':'string'},
-            'data':{'type':'string','description':'Dataset name, e.g. "E", "T"'},
-            'fields':{'type':'array','items':{'type':'string'},
-                'description':'Field names to retrieve (use result_list first)'},
-            'cap':{'type':'number','description':'Per-field array cap (default 2000)'}},
-            'required':['monitor','fields']}),
-    types.Tool(name='result_save',
-        description=(
-            'Save result data to .mat file for offline analysis.\n'
-            '\n'
-            'Examples:\n'
-            '  result_save(monitor="DFT", data="E")\n'
-            '  result_save(monitor="DFT", data="E", output="C:/data/fields.mat")'
-        ),
-        inputSchema={'type':'object','properties':{
-            'monitor':{'type':'string'},'data':{'type':'string'},
-            'output':{'type':'string','description':'Output .mat file path (optional)'}},
-            'required':['monitor','data']}),
-    types.Tool(name='result_has',
-        description=(
-            'Check whether a monitor/element has results WITHOUT throwing an exception.\n'
-            'Returns {exists: true/false}. Call before result_get to avoid errors\n'
-            'when a monitor has no results (e.g. before simulation is run).\n'
-            '\n'
-            'Example:\n'
-            '  result_has(monitor="DFT") -> {exists: true}'
-        ),
-        inputSchema={'type':'object','properties':{
-            'monitor':{'type':'string'}}, 'required':['monitor']}),
 
-    # ==================================================================
-    # Module: engine (4 tools)
-    # ==================================================================
-    types.Tool(name='run',
-        description=(
-            'Run the FDTD simulation once. Blocks until completion.\n'
-            'timeout (seconds) bounds the wait; on expiry the engine is '
-            'restarted (set 0 to wait forever, default from FDTD_MCP_CALL_TIMEOUT).'
-        ),
-        inputSchema={'type':'object','properties':{
-            'timeout':{'type':'number','description':'Optional wait bound in seconds (0 = no timeout)'}}}),
-    types.Tool(name='execute',
-        description=(
-            'Execute LSF script code directly. Supports full multi-line LSF scripts '
-            'passed to the Lumerical engine via eval().\n'
-            '\n'
-            'PATTERNS:\n'
-            '  Query value:    execute("?getnamed(\\"::model\\", \\"gap\\")")\n'
-            '                    -> prefix with ? to capture return value\n'
-            '  Delete object:  execute(\'select("obj_name"); delete();\')\n'
-            '                    -> NOT delete("name") -- use select+delete form\n'
-            '  Create object:  execute("addrect(); setnamed(\\"rect\\", \\"x span\\", 1e-6)")\n'
-            '  Multi-line:     execute("for i=1:10; ?i; end")\n'
-            '\n'
-            'DO NOT use execute for:\n'
-            '  - Editing scripts       -> use model_script tool instead\n'
-            '  - Setting material props -> use material_set tool instead\n'
-            '  - Opening/saving files  -> use session_open/session_save tools instead\n'
-            '\n'
-            'OK for execute:\n'
-            '  - Material file import:  execute(\'importnk("C:/path/to/file.txt")\')'
-        ),
-        inputSchema={'type':'object','properties':{
-            'code':{'type':'string','description':'LSF script code (multi-line supported)'},
-            'timeout':{'type':'number','description':'Optional wait bound in seconds (0 = no timeout)'}},
-            'required':['code']}),
-    types.Tool(name='execute_file',
-        description='Run a Lumerical script file (.lsf).',
-        inputSchema={'type':'object','properties':{
-            'path':{'type':'string'},
-            'timeout':{'type':'number','description':'Optional wait bound in seconds (0 = no timeout)'}},
-            'required':['path']}),
-    types.Tool(name='reference_lookup',
-        description=(
-            'Look up VERIFIED Lumerical API signature/parameter ranges BEFORE writing scripts.\n'
-            'This is a server-side tool (no bridge call) that reads a curated bundled cheatsheet.\n'
-            '\n'
-            'Modes:\n'
-            '  reference_lookup(name="getresult")   -> full entry: signature, args, pitfalls\n'
-            '  reference_lookup(list_only=true)      -> all known function names\n'
-            '  reference_lookup(category="result")   -> all entries in one category\n'
-            '\n'
-            'Always call list_only=true first before referencing a Lumerical function\n'
-            'to ensure it exists. Script validation will warn about unrecognized function names.'
-        ),
-        inputSchema={'type':'object','properties':{
-            'name':{'type':'string','description':'Exact Lumerical API function name, e.g. getresult'},
-            'category':{'type':'string','description':'Filter by category: result|source|material|object|analysis|variable|sweep|mesh|monitor|general'},
-            'list_only':{'type':'boolean','description':'If true, return only function names (ignores name/category)'}}}),
-]
+def _handle_engine_cleanup(arguments):
+    """Server-side engine_cleanup: reap orphans, optionally restart the bridge."""
+    args = dict(arguments) if arguments else {}
+    dry_run = bool(args.get('dry_run'))
+    include_orphans = args.get('include_orphans', True)
+    if include_orphans is None:
+        include_orphans = True
+    before = _engine_process_status()
+    if dry_run:
+        return {'result': {
+            'dry_run': True,
+            'would_kill': before.get('orphan_pids', []),
+            'kept_foreign': before.get('foreign_pids', []),
+            'before': before,
+        }}
+    result = {'before': before}
+    if args.get('restart_bridge'):
+        _bridge.stop()          # taskkill /T: bridge python + its engine
+        _ensure_bridge()
+        result['bridge_restarted'] = {'generation': getattr(
+            _bridge, 'bridge_code_id', None)}
+    if include_orphans:
+        result['sweep'] = _sweep_orphan_engines(force=True)
+    result['after'] = _engine_process_status()
+    result['status'] = 'ok'
+    return {'result': result}
 
-# ---- Startup validation: TOOLS and dispatch.json must agree ----
-# Hidden tools stay dispatchable (in dispatch.json) but are not advertised.
-TOOLS = [t for t in TOOLS if t.name not in _HIDDEN_TOOLS]
-_tool_names = {t.name for t in TOOLS}
-_missing = _tool_names - _SERVER_ONLY_TOOLS - set(_DISPATCH.keys())
+
+# ---- Tools, annotations and validation derived from toolspec.SPECS ----
+_VISIBLE = visible_specs()
+TOOLS = [types.Tool(name=s.name, description=s.description, inputSchema=s.schema)
+         for s in _VISIBLE]
+for _spec, _tool in zip(_VISIBLE, TOOLS):
+    if _spec.read_only:
+        _tool.annotations = types.ToolAnnotations(readOnlyHint=True)
+    elif _spec.destructive:
+        _tool.annotations = types.ToolAnnotations(destructiveHint=True)
+
+_TOOL_NAMES = {t.name for t in TOOLS}
+_SPEC_BY_NAME = spec_by_name()
+
+# Startup validation: specs <-> dispatch.json <-> server-only set.
+_missing = _TOOL_NAMES - _SERVER_ONLY_TOOLS - set(_DISPATCH.keys()) - _HIDDEN_TOOLS
 if _missing:
     raise RuntimeError('Tools missing from dispatch.json: ' + ', '.join(sorted(_missing)))
-_extra = (set(_DISPATCH.keys()) | _SERVER_ONLY_TOOLS) - _tool_names - _HIDDEN_TOOLS
+_extra = (set(_DISPATCH.keys()) | _SERVER_ONLY_TOOLS) - set(_SPEC_BY_NAME)
 if _extra:
     raise RuntimeError('dispatch.json references unknown tools: ' + ', '.join(sorted(_extra)))
-
-# ---- Tool annotations (Claude review criteria: read/write split) ----
-_READ_ONLY_TOOLS = {
-    'model_info', 'model_get', 'material_get', 'material_exists',
-    'result_list', 'result_get', 'sweep_get', 'reference_lookup',
-}
-_DESTRUCTIVE_TOOLS = {
-    'session_open', 'session_new', 'session_close',
-    'model_delete', 'material_delete', 'sweep_delete',
-    'execute', 'execute_file',
-}
-_LONG_RUNNING_TOOLS = frozenset({'run', 'sweep_run', 'execute', 'execute_file'})
-for _t in TOOLS:
-    if _t.name in _READ_ONLY_TOOLS:
-        _t.annotations = types.ToolAnnotations(readOnlyHint=True)
-    elif _t.name in _DESTRUCTIVE_TOOLS:
-        _t.annotations = types.ToolAnnotations(destructiveHint=True)
+for _name, _method in _DISPATCH.items():
+    _spec = _SPEC_BY_NAME.get(_name)
+    if _spec is not None and _spec.bridge_method != _method:
+        raise RuntimeError(
+            'toolspec/dispatch disagree for %s: spec says %s, dispatch.json says %s'
+            % (_name, _spec.bridge_method, _method))
 
 app = Server('fdtd-mcp')
 
@@ -743,63 +478,149 @@ async def list_tools(): return TOOLS
 
 @app.call_tool()
 async def call_tool(name: str, arguments: dict[str, Any]):
+    spec = _SPEC_BY_NAME.get(name)
+    if spec is None:
+        raise ValueError('Unknown tool: ' + name)
+
     # ----------------------------------------------------------------
     # Server-side tools (NO bridge round-trip)
     # ----------------------------------------------------------------
-    if name == 'reference_lookup':
-        return _handle_lumapi_ref(arguments)
+    if spec.server_only:
+        if name == 'reference_lookup':
+            return _handle_lumapi_ref(arguments)
+        if name == 'engine_cleanup':
+            return _handle_engine_cleanup(arguments)
+        if name == 'library_list':
+            return _handle_library_list(arguments)
+        raise ValueError('No server-side handler for ' + name)
 
     # ----------------------------------------------------------------
     # Bridge-dispatched tools
     # ----------------------------------------------------------------
-    bm = _DISPATCH.get(name)
-    if not bm:
-        raise ValueError('Unknown tool: ' + name)
-
     _ensure_bridge()
 
     params = dict(arguments) if arguments else {}
-
-    # ---- Parameter defaults ----
-    if name == 'model_script':
-        params['action'] = arguments.get('action', 'get')
-        params['script_type'] = arguments.get('script_type', '')
-    if name == 'sweep_add':
-        params['type'] = arguments.get('type', 0)
-    if name in ('result_get', 'result_list'):
-        params['data'] = arguments.get('data', '')
-    if name == 'result_save':
-        params['output'] = arguments.get('output', '')
-    if name == 'result_get':
-        params['cap'] = arguments.get('cap', 2000)
-        params['fields'] = arguments.get('fields', [])
+    for key, value in spec.defaults.items():
+        params.setdefault(key, value)
 
     # Per-call timeout override for long-running tools (0 disables the bound).
     call_timeout = _CALL_TIMEOUT
-    if name in _LONG_RUNNING_TOOLS:
+    if spec.launch:
+        launch_bound = _LAUNCH_TIMEOUT if _LAUNCH_TIMEOUT > 0 else None
+        if call_timeout is None:
+            call_timeout = launch_bound
+        elif launch_bound is not None:
+            call_timeout = min(call_timeout, launch_bound)
+    if spec.long_running:
         t = arguments.get('timeout')
         if t is not None:
             call_timeout = float(t) if t > 0 else 0.0
-        params.pop('timeout', None)
+    params.pop('timeout', None)
 
     # ---- Script scan (advisory, non-blocking) ----
     warnings = []
     if _LUMAPI_NAMES:
         if name == 'execute':
-            text = params.get('code', '')
-            warnings = _scan_script_for_unknown_funcs(text)
+            warnings = _scan_script_for_unknown_funcs(params.get('code', ''))
         elif name == 'model_script' and params.get('action') == 'set':
-            text = params.get('content', '')
-            warnings = _scan_script_for_unknown_funcs(text)
+            warnings = _scan_script_for_unknown_funcs(params.get('content', ''))
 
-    # Run the blocking bridge call off the event loop so the server stays
-    # responsive (progress/cancellation/other requests) during long calls.
-    result = await anyio.to_thread.run_sync(_bridge.call, bm, params, call_timeout)
+    try:
+        # Run the blocking bridge call off the event loop so the server stays
+        # responsive (progress/cancellation/other requests) during long calls.
+        result = await anyio.to_thread.run_sync(_bridge.call, spec.bridge_method,
+                                                params, call_timeout)
+    except RuntimeError as e:
+        notice = _bridge.take_restart_notice()
+        if notice:
+            raise RuntimeError('%s (%s)' % (e, notice))
+        raise
+
     if result is None:
         result = {}
+    if spec.name == 'engine_status' and isinstance(result, dict):
+        result['server'] = _server_status()
     if warnings:
         result['warnings'] = warnings
+    notice = _bridge.take_restart_notice()
+    if notice:
+        result.setdefault('warnings', []).append(notice)
     return {'result': result}
+
+
+def _server_status():
+    """Server-side half of engine_status."""
+    return {
+        'server_code_id': _SERVER_CODE_ID,
+        'tool_count': len(TOOLS),
+        'spec_count': len(SPECS),
+        'cheatsheet_functions': len(_LUMAPI_NAMES),
+        'verified_against': VERIFIED_AGAINST,
+        'call_timeout_s': _CALL_TIMEOUT,
+        'launch_timeout_s': _LAUNCH_TIMEOUT,
+        'bridge_alive': not _bridge.is_dead(),
+        'bridge_code_id': getattr(_bridge, 'bridge_code_id', None),
+        'bridge_unsolicited_output': _bridge.unsolicited()[-5:],
+        'lumerical_home': LUMERICAL_HOME,
+        'engine_processes': _engine_process_status(),
+    }
+
+
+def _library_item(entry):
+    """Compact catalog entry for library_list."""
+    summary = entry.get('summary') or ''
+    if len(summary) > 100:
+        summary = summary[:97] + '...'
+    return {'id': entry['id'], 'type': entry['type'],
+            'category': entry['category'], 'summary': summary,
+            'installed': entry.get('installed', False)}
+
+
+def _handle_library_list(arguments):
+    """Server-side object-library listing (reads the install's catalog.xml)."""
+    args = dict(arguments) if arguments else {}
+    base = library.library_dir(LUMERICAL_HOME)
+    items = library.catalog(LUMERICAL_HOME)
+    if not items:
+        return {'result': {
+            'library_dir': base, 'count': 0, 'total': 0,
+            'error': ('No object library catalog found (looked for %s under '
+                      'LUMERICAL_HOME=%s).' % (library.LIBRARY_SUBDIR,
+                                               LUMERICAL_HOME or '<unset>'))}}
+
+    want_id = (args.get('id') or '').strip()
+    if want_id:
+        entry = library.find(want_id, LUMERICAL_HOME)
+        if entry is None:
+            return {'result': {
+                'library_dir': base, 'total': len(items), 'count': 0,
+                'error': 'No object-library item with id "%s".' % want_id,
+                'did_you_mean': library.suggest(want_id, LUMERICAL_HOME)}}
+        return {'result': {'library_dir': base, 'total': len(items),
+                           'count': 1, 'items': [_library_item(entry)]}}
+
+    want_type = (args.get('type') or '').strip().lower()
+    want_cat = (args.get('category') or '').strip().lower()
+    try:
+        limit = int(args.get('limit') or 60)
+    except (TypeError, ValueError):
+        limit = 60
+    limit = max(1, limit)
+
+    matched = [i for i in items
+               if (not want_type or want_type in i['type'].lower())
+               and (not want_cat or want_cat in i['category'].lower())]
+    return {'result': {
+        'library_dir': base,
+        'total': len(items),
+        'counts_by_type': library.counts(items),
+        'matched': len(matched),
+        'returned': min(len(matched), limit),
+        'truncated': len(matched) > limit,
+        'categories': sorted(set(i['category'] for i in matched)),
+        'items': [_library_item(i) for i in matched[:limit]],
+        'next': 'library_insert(name="<id>") to insert one into the open project',
+    }}
 
 
 def _handle_lumapi_ref(arguments):
@@ -857,9 +678,11 @@ _LSF_BUILTINS = frozenset({
     'addpyramid', 'addtriangle', 'addwaveguide',
     # Sources
     'addtfsf', 'addgaussian', 'addplane', 'adddipole',
-    # Monitors
-    'addpower', 'addmovie', 'addindex', 'addfield',
-    'adddftmonitor',
+    # Monitors.
+    # NOTE: addfield/adddftmonitor do not exist in v202 (verified live) — every
+    # frequency-domain monitor is an addpower object — so they are not
+    # allowlisted and a script using them raises the advisory warning.
+    'addpower', 'addmovie', 'addindex', 'addprofile',
     # Mesh
     'addmesh',
     # Groups
@@ -867,20 +690,26 @@ _LSF_BUILTINS = frozenset({
     'addgroup', 'addtogroup',
     # Ports / EME / import
     'addimport', 'addmode', 'addport', 'addeme',
-    # Variables & user properties
-    'addvar', 'setvar', 'getvar', 'addvarfdtd',
+    # Variables & user properties.
+    # NOTE: addvar/setvar/getvar/addvarfdtd were removed in v202 (verified live)
+    # and are deliberately NOT allowlisted — a script using them must raise the
+    # advisory warning so the model looks up the real replacement (adduserprop
+    # on the selected model root / group).
     'adduserprop', 'addanalysisprop', 'addanalysisresult',
+    'queryuserprop', 'queryanalysisprop',
     'addimportnk',
     # Sweep
-    'addsweepparameter', 'addsweepresult',
+    'addsweep', 'addsweepparameter', 'addsweepresult',
     'removesweepparameter', 'removesweepresult',
     'getsweep', 'getsweepdata', 'deletesweep',
     'copysweep', 'pastesweep', 'insertsweep',
     'setsweep',
-    # Results
+    # Results.
+    # NOTE: findresult/hasresult/listresults do not exist in v202 (verified
+    # live) — only haveresult does, so they are not allowlisted.
     'getresult', 'getdata', 'getresultdata',
     'getelectric', 'getmagnetic',
-    'listresults', 'findresult', 'clearresults', 'clearanalysis',
+    'clearresults', 'clearanalysis',
     'haveresult',
     # Farfield / transmission
     'farfield', 'farfield3d', 'farfieldpolar',
@@ -898,23 +727,57 @@ _LSF_BUILTINS = frozenset({
     'system', 'save', 'close',
 })
 
+# Runtime invariant (the static guard test also checks it): the allowlist must
+# never bless a command the engine is known not to have.
+_blessed_dead = sorted(_LSF_BUILTINS & DEAD_COMMANDS)
+if _blessed_dead:
+    raise RuntimeError('_LSF_BUILTINS allowlists unavailable commands: '
+                       + ', '.join(_blessed_dead))
+
 
 def _scan_script_for_funcs(text):
-    """Extract all \bFuncName( tokens, ignoring comments and string literals."""
-    clean = re.sub(r'%.*?(\n|$)', ' ', text)  # LSF comments start with %
+    """Extract all \\bFuncName( tokens, ignoring comments and string literals.
+
+    Verified live on v202: `#` is the LSF comment character. (`%` is NOT — a
+    `%` line makes the whole script fail — so it is only blanked here to keep
+    the token scan quiet; `_percent_comment_warning` reports it separately.)
+    """
+    clean = re.sub(r'#.*', ' ', text)         # LSF comments start with #
+    clean = re.sub(r'%.*', ' ', clean)        # not a comment on v202; don't scan it
     clean = re.sub(r'"[^"]*"', ' ', clean)    # double-quoted strings
     clean = re.sub(r"'[^']*'", ' ', clean)    # single-quoted strings
     return set(re.findall(r'(?:\b)([A-Za-z_]\w*)\s*\(', clean))
+
+
+def _percent_comment_warning(text):
+    """Warn about `%` line comments, which v202 rejects.
+
+    This closes a documented-by-usage trap: `%` looks like a comment in many
+    Lumerical examples, but a script containing one fails with the unhelpful
+    'Failed to evaluate code' the moment it runs (runsetup / run).
+    """
+    if not text:
+        return []
+    lines = [n for n, line in enumerate(text.split('\n'), 1)
+             if line.strip().startswith('%')]
+    if not lines:
+        return []
+    return ['Script uses "%" line comments on line(s) '
+            + ', '.join(str(n) for n in lines)
+            + ', but LSF comments start with "#" — on v202 a "%" line makes the '
+              'whole script fail with "Failed to evaluate code". Replace them '
+              'with "#".']
 
 
 def _scan_script_for_unknown_funcs(text):
     """Return advisory warnings for unrecognized function calls in script text."""
     if not text:
         return []
+    warnings = _percent_comment_warning(text)
     called = _scan_script_for_funcs(text)
     unknown = called - _LUMAPI_NAMES - _LSF_BUILTINS
     if not unknown:
-        return []
+        return warnings
     sorted_u = sorted(unknown)
     msg = (
         'Script contains function names not recognized: '
@@ -923,7 +786,8 @@ def _scan_script_for_unknown_funcs(text):
         'If you intended to call a Lumerical API function, first call '
         'reference_lookup(list_only=true) to check it exists and get the correct signature.'
     )
-    return [msg]
+    warnings.append(msg)
+    return warnings
 
 _bridge_started = False
 _bridge_start_lock = threading.Lock()
@@ -943,6 +807,9 @@ def main():
     import anyio; anyio.run(_main)
 
 async def _main():
+    # Before the new bridge exists: sweep engines orphaned by the previous
+    # server generation (its bridge is dead, so they can never be reached).
+    _sweep_orphan_engines()
     _ensure_bridge()
     async with stdio_server() as (r, w):
         await app.run(r, w, app.create_initialization_options())

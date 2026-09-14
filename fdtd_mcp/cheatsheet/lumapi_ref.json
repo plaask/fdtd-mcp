@@ -222,13 +222,13 @@
     "returns": "n/a",
     "valid_args": {},
     "common_pitfalls": [
-      "Verified on v202 (2026-08): addvar/addvarfdtd/setvar/getvar are all dead via LSF/appCall",
-      "Model variables must be created in the GUI (Model Variables tab)",
-      "sweep parameter paths like ::model>gap require the variable to already exist",
-      "Writing addvar into a script does not help — the command is gone in v202"
+      "Verified live on v202: addvar/addvarfdtd/setvar/getvar are all dead via LSF *and* appCall",
+      "Writing addvar into a script does not help — the command is gone in v202",
+      "Model variables are created with adduserprop(\"name\", type_code, value) while ::model is SELECTED (see the adduserprop entry), or in the GUI",
+      "sweep parameter paths like ::model::gap require the variable to exist first — model_set(name=\"::model\", properties={...}) creates it"
     ],
     "category": "variable",
-    "verified_against": "proven — dead on v202"
+    "verified_against": "proven — dead on v202 (re-verified live)"
   },
   "setvar": {
     "signature": "NOT AVAILABLE in v202 (same as addvar).",
@@ -251,21 +251,99 @@
     "verified_against": "proven — dead on v202"
   },
   "adduserprop": {
-    "signature": "adduserprop(\"name\", type_code, value)  — called from within a group's setup script (which executes immediately on model_script set)",
-    "returns": "none (adds a user-defined property to an analysis/structure group)",
+    "signature": "adduserprop(\"name\", type_code, value)  — acts on the CURRENTLY SELECTED object",
+    "returns": "none (declares a user property / model variable on that object)",
     "valid_args": {
       "name": "property name",
       "type_code": "INTEGER 0-5: 0=number, 1=text, 2=length, 3=time, 4=frequency, 5=material",
       "value": "default value"
     },
     "common_pitfalls": [
-      "The 2-arg form adduserprop('name', value) FAILS on v202 and aborts the whole group script (no children/props created)",
-      "The string-type form adduserprop('name', value, 'Length') ALSO FAILS on v202 ('Property value is the wrong type') — type must be the INTEGER code, e.g. adduserprop('thickness', 2, 100e-9)",
-      "addanalysisprop mirrors this for analysis groups",
-      "Properties created via adduserprop are read via getnamed(obj, \"name\") and settable via model_set"
+      "Verified live on v202: select the target first — select(\"mygroup\") for a group property. With nothing (or a non-group) selected it fails with 'adduserprop requires a single structure or analysis group object to be selected'",
+      "The model root (::model, type 'ObjectModelRoot') ACCEPTS adduserprop, but a property created that way does NOT show up in the GUI's \"Edit analysis group\" dialog — that dialog lists ANALYSIS properties, so use addanalysisprop for ::model (the bridge does)",
+      "Structure groups are the intended target: adduserprop is what their Parameters table shows",
+      "The 2-arg form adduserprop('name', value) FAILS on v202",
+      "The string-type form adduserprop('name', value, 'Length') ALSO FAILS on v202 ('argument list ... command is incorrect') — the type must be the INTEGER code",
+      "An existing property is updated with setnamed(obj, name, value); adduserprop is only for creating a new one",
+      "NOT idempotent (verified live on v202): calling adduserprop again for a property that already exists does NOT error and does NOT update it — it creates a SUFFIXED CLONE (period -> period2 -> period3). A group setup script that re-declares its own properties therefore piles up clones every time runsetup runs, and bare-name references in that script silently point at a renamed property",
+      "Correct pattern for a re-runnable group script: declare the properties ONCE from outside (model_set(name=\"mygroup\", properties={...}) — the bridge only calls adduserprop when setnamed failed), and let the script read them by bare name",
+      "addanalysisprop (analysis groups) has the same 3-arg/selection semantics and the same non-idempotency",
+      "Registering adduserprop in a setup script only takes effect when that script actually runs (runsetup) — it is NOT executed by writing the script alone",
+      "In an ANALYSIS group's own *setup* script, the group's properties are not usable as bare names on v202 (verified: the script fails with 'Failed to evaluate code' while the same script works on a structure group); write literals there and keep the properties in sync with model_set"
     ],
     "category": "variable",
-    "verified_against": "proven — integer type-code form on v202"
+    "verified_against": "proven live on v202 — model root, structure group and analysis group"
+  },
+  "queryuserprop": {
+    "signature": "queryuserprop()  — no arguments, acts on the current selection (model root or structure group)",
+    "returns": "{'name': [...], 'type': ['0', '2', ...]} for the user properties of the selected object",
+    "valid_args": {},
+    "common_pitfalls": [
+      "Verified live on v202: select(\"::model\"); queryuserprop() lists GUI-created *and* adduserprop-created model variables — this is the reliable way to enumerate them (regex-scanning scripts is not)",
+      "On an analysis group it aborts with 'NULL pointer access' — use queryanalysisprop(obj) there",
+      "An empty object is returned when the selection has no user properties"
+    ],
+    "category": "variable",
+    "verified_against": "proven live on v202"
+  },
+  "addanalysisprop": {
+    "signature": "addanalysisprop(\"name\", type_code, value)  — acts on the CURRENTLY SELECTED analysis group",
+    "returns": "none",
+    "valid_args": {
+      "name": "property name",
+      "type_code": "INTEGER 0-5 (see adduserprop)",
+      "value": "default value"
+    },
+    "common_pitfalls": [
+      "Verified live on v202: select(\"ag1\"); addanalysisprop(\"period\", 2, 1e-6) creates the property; the 2-arg and 4-arg (object-first) forms both fail with 'argument list for addanalysisprop command is incorrect'",
+      "**This is the command that fills the Analysis > Variables table** of the GUI's \"Edit analysis group\" dialog — for the MODEL ROOT too: select(\"::model\"); addanalysisprop(\"gap\", 2, 200e-9). A model property created with adduserprop instead does NOT appear in that dialog (verified in the GUI)",
+      "Structure groups are the other way round: they use adduserprop",
+      "Analysis and user properties SHARE a namespace: declaring a name that already exists creates a suffixed clone (\"gap\" -> \"gap2\") instead of updating it",
+      "Verify with select(\"<obj>\"); queryanalysisprop(\"<obj>\") — the query needs the object selected"
+    ],
+    "category": "variable",
+    "verified_against": "proven live on v202 (model root and analysis groups)"
+  },
+  "addanalysisresult": {
+    "signature": "addanalysisresult(\"name\")  — ONE argument on the model root / analysis group",
+    "returns": "none (declares a result name for the dialog's Results table)",
+    "valid_args": {
+      "name": "result name"
+    },
+    "common_pitfalls": [
+      "Verified live on v202: the 2-arg form addanalysisresult(\"name\", value) and the 3-arg form both FAIL on the model root with 'Failed to evaluate code'; inside an analysis script the value-carrying form is what Lumerical's own templates use",
+      "Declare it with the object selected: select(\"::model\"); addanalysisresult(\"T_spectrum\")",
+      "Verify with select(\"<obj>\"); queryanalysisresult(\"<obj>\") -> ['T_spectrum', ...]"
+    ],
+    "category": "variable",
+    "verified_against": "proven live on v202"
+  },
+  "queryanalysisprop": {
+    "signature": "queryanalysisprop(\"objname\") — the object must ALSO be selected",
+    "returns": "{'name': [...], 'type': [...]} for that object's analysis properties",
+    "valid_args": {
+      "objname": "analysis group or ::model"
+    },
+    "common_pitfalls": [
+      "Verified live on v202: with nothing (or an ordinary object) selected it fails with 'queryanalysisprop requires a single analysis group object to be selected' — call select(\"::model\") first",
+      "This is the exact content of the GUI dialog's Analysis > Variables table",
+      "The model root counts: queryanalysisprop(\"::model\") lists the model's parameters"
+    ],
+    "category": "variable",
+    "verified_against": "proven live on v202"
+  },
+  "queryanalysisresult": {
+    "signature": "queryanalysisresult(\"objname\") — the object must ALSO be selected",
+    "returns": "['T_spectrum', ...] — the names declared with addanalysisresult",
+    "valid_args": {
+      "objname": "analysis group or ::model"
+    },
+    "common_pitfalls": [
+      "Verified live on v202; this is the content of the GUI dialog's Results table",
+      "Same selection requirement as queryanalysisprop"
+    ],
+    "category": "variable",
+    "verified_against": "proven live on v202"
   },
   "select": {
     "signature": "select(\"object_name\")",
@@ -403,5 +481,85 @@
     ],
     "category": "general",
     "verified_against": "pending"
+  },
+  "addvarfdtd": {
+    "signature": "NOT AVAILABLE in v202 — 'is not a valid function or variable name'.",
+    "returns": "n/a",
+    "valid_args": {},
+    "common_pitfalls": [
+      "Verified live on v202 alongside addvar/setvar/getvar — the whole variable-command family is gone",
+      "Use adduserprop(\"name\", type_code, value) with ::model selected"
+    ],
+    "category": "variable",
+    "verified_against": "proven — dead on v202 (live)"
+  },
+  "adddftmonitor": {
+    "signature": "NOT AVAILABLE in v202 — 'is not a valid function or variable name'.",
+    "returns": "n/a",
+    "valid_args": {},
+    "common_pitfalls": [
+      "Verified live on v202: a DFT monitor is added with addpower(); its DFT/frequency-domain output is configured through the monitor's properties",
+      "model_add(type=\"dft_monitor\") already maps to addpower"
+    ],
+    "category": "monitor",
+    "verified_against": "proven — dead on v202 (live)"
+  },
+  "addfield": {
+    "signature": "NOT AVAILABLE in v202 — 'addfield is not a valid function or variable name'.",
+    "returns": "n/a",
+    "valid_args": {},
+    "common_pitfalls": [
+      "Verified live on v202 (model_add(type=\"field_monitor\") failed on the real engine): the only monitor adders are addpower, addindex, addmovie and addprofile",
+      "A frequency-domain (DFT/field) monitor IS an addpower object: set 'monitor type' (e.g. '2D Z-normal') plus the output switches (output Ex/Ey/Ez/Hx/Hy/Hz)",
+      "model_add(type=\"field_monitor\") now maps to addpower"
+    ],
+    "category": "monitor",
+    "verified_against": "proven — dead on v202 (live)"
+  },
+  "findresult": {
+    "signature": "NOT AVAILABLE in v202 — 'is not a valid function or variable name'.",
+    "returns": "n/a",
+    "valid_args": {},
+    "common_pitfalls": [
+      "Verified live on v202; haveresult(name) is the command that exists",
+      "getresult(name) throws when a monitor has no results, so guard with haveresult first"
+    ],
+    "category": "result",
+    "verified_against": "proven — dead on v202 (live)"
+  },
+  "hasresult": {
+    "signature": "NOT AVAILABLE in v202 — 'is not a valid function or variable name'.",
+    "returns": "n/a",
+    "valid_args": {},
+    "common_pitfalls": [
+      "Verified live on v202 — use haveresult(name), which returns 1/0"
+    ],
+    "category": "result",
+    "verified_against": "proven — dead on v202 (live)"
+  },
+  "listresults": {
+    "signature": "NOT AVAILABLE in v202 — 'is not a valid function or variable name'.",
+    "returns": "n/a",
+    "valid_args": {},
+    "common_pitfalls": [
+      "Verified live on v202 — to enumerate available results call getresult(name) for the dataset list, and haveresult(name) per object"
+    ],
+    "category": "result",
+    "verified_against": "proven — dead on v202 (live)"
+  },
+  "addobject": {
+    "signature": "addobject(\"<catalog id>\")  -> inserts an OBJECT LIBRARY item into the current project",
+    "returns": "none (the item is copied in and its setup script re-runs)",
+    "valid_args": {
+      "name": "object-library catalog id from Resources/fdtd-library/catalog.xml"
+    },
+    "common_pitfalls": [
+      "Verified live on v202 (2026-09): addobject(\"Qanalysis\") created Analysis Group \"Qanalysis\" with 4 time monitors t1..t4 and its setup/analysis scripts intact; addobject(\"ring_resonator\") created Structure Group \"ring resonator\" with 8 child waveguides; addobject(\"sphere\") created a plain Sphere (some library items are primitives, not groups)",
+      "The created object keeps the library item's own name, spaces included (\"ring resonator\")",
+      "The library lives at <LUMERICAL_HOME>/Resources/fdtd-library: 129 items (96 Structures + 33 Analysis). The MCP tools library_list / library_insert wrap this command",
+      "An unknown id is silently ignored by the engine, so validate against the catalog first (engine/library.py: find/suggest)"
+    ],
+    "category": "object",
+    "verified_against": "v202 - live engine probes 2026-09"
   }
 }

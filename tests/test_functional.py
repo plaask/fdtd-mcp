@@ -75,7 +75,7 @@ class _BridgeSession(object):
 @pytest.fixture(scope='module')
 def bs():
     s = _BridgeSession()
-    assert s.ready == {'ready': True}
+    assert s.ready.get('ready') is True
     yield s
     s.close()
 
@@ -234,17 +234,85 @@ def test_model_script_get_and_set(bs):
     # Regression: the server sends script_type=; _cmd_set_script now accepts it.
     r = bs.send('model_script', {'name': '::model', 'action': 'set',
                                  'script_type': 'setup',
-                                 'content': 'addvar("gap", 200e-9)'})
+                                 'content': 'adduserprop("gap", 2, 200e-9);'})
     assert r['result']['status'] == 'ok'
     assert r['result']['script_type'] == 'setup script'
     r = bs.send('model_script', {'name': '::model', 'action': 'get'})
-    assert 'addvar("gap"' in r['result']['setup_script']
+    assert 'adduserprop("gap"' in r['result']['setup_script']
 
     # Legacy 'type' key is still accepted.
     r = bs.send('model_script', {'name': '::model', 'action': 'set',
                                  'type': 'setup',
-                                 'content': 'addvar("gap2", 1e-9)'})
+                                 'content': 'adduserprop("gap2", 2, 1e-9);'})
     assert r['result']['status'] == 'ok'
+
+
+def test_model_set_creates_model_variable(bs):
+    """The v202 way to add a model parameter: adduserprop on the selected
+    model root. Regression guard for the addvar-based path, which silently
+    failed on the real engine while the fake kept it green."""
+    bs.fresh()
+    r = bs.send('model_set', {'name': '::model', 'properties': {'gap': 200e-9}})
+    assert r['result']['status'] == 'ok'
+    assert r['result']['properties_set'] == 1
+    assert 'properties_failed' not in r['result']
+
+    r = bs.send('model_get', {'name': '::model'})
+    assert r['result']['variables']['gap'] == 200e-9
+
+    # ... and the value of an existing variable can be updated afterwards
+    r = bs.send('model_set', {'name': '::model', 'properties': {'gap': 300e-9}})
+    assert r['result']['properties_set'] == 1
+    r = bs.send('model_get', {'name': '::model'})
+    assert r['result']['variables']['gap'] == 300e-9
+
+
+def test_model_set_types_and_groups(bs):
+    bs.fresh()
+    # text/number inference + explicit type code
+    r = bs.send('model_set', {'name': '::model',
+                              'properties': {'nsub': 3, 'tag': 'demo'},
+                              'property_types': {'nsub': 'number'}})
+    assert r['result']['status'] == 'ok', r
+
+    # analysis group -> addanalysisprop, structure group -> adduserprop
+    bs.send('model_add', {'type': 'analysis_group', 'name': 'ag1'})
+    r = bs.send('model_set', {'name': 'ag1', 'properties': {'period': 1e-6}})
+    assert r['result']['status'] == 'ok' and r['result']['properties_set'] == 1
+    r = bs.send('model_get', {'name': 'ag1'})
+    assert r['result']['period'] == 1e-6
+
+    bs.send('model_add', {'type': 'structure_group', 'name': 'sg1'})
+    r = bs.send('model_set', {'name': 'sg1', 'properties': {'thickness': 1e-7}})
+    assert r['result']['status'] == 'ok' and r['result']['properties_set'] == 1
+    r = bs.send('model_get', {'name': 'sg1'})
+    assert r['result']['thickness'] == 1e-7
+
+
+def test_model_set_failure_is_loud(bs):
+    """A property that cannot be created must not come back as status=ok."""
+    bs.fresh()
+    r = bs.send('model_add', {'type': 'rectangle', 'name': 'r1'})
+    r = bs.send('model_set', {'name': 'r1',
+                              'properties': {'x span': 3e-6, 'no such prop': 1}})
+    assert r['result']['status'] == 'partial'
+    assert r['result']['properties_set'] == 1
+    assert r['result']['properties_failed'] == ['no such prop']
+    assert 'no such prop' in r['result']['failures']
+
+    r = bs.send('model_set', {'name': 'r1', 'properties': {'no such prop': 1}})
+    assert r['result']['status'] == 'error'
+    assert r['result']['properties_set'] == 0
+
+
+def test_dead_v202_commands_are_rejected(bs):
+    """addvar/setvar are gone from v202; the fake must reject them so tests
+    cannot certify the removed API again."""
+    bs.fresh()
+    r = bs.send('execute', {'code': 'addvar("gap", 200e-9);'})
+    assert 'error' in r and 'not a valid function' in r['error']['message']
+    r = bs.send('execute', {'code': 'setvar("gap", 1);'})
+    assert 'error' in r and 'not a valid function' in r['error']['message']
 
 
 # ---------------------------------------------------------------------------
@@ -457,8 +525,17 @@ def test_execute_file(bs, tmp_path):
 def test_ref_list_only():
     r = srv._handle_lumapi_ref({'list_only': True})
     res = r['result']
-    assert res['function_count'] == 32
+    # Count against the bundled file instead of a frozen number, so adding a
+    # verified entry does not fail the suite.
+    import fdtd_mcp.cheatsheet  # noqa: F401  (package marker)
+    import json as _json
+    from pathlib import Path as _Path
+    path = _Path(srv.__file__).resolve().parent / 'cheatsheet' / 'lumapi_ref.json'
+    with open(str(path), 'r', encoding='utf-8') as f:
+        entries = _json.load(f)
+    assert res['function_count'] == len([k for k in entries if k != 'meta'])
     assert 'getresult' in res['functions']
+    assert res['function_count'] > 0
 
 
 def test_ref_by_name():
@@ -505,6 +582,12 @@ class _Recorder(object):
 
     def is_dead(self):
         return False
+
+    def take_restart_notice(self):
+        return None
+
+    def unsolicited(self):
+        return []
 
 
 def _patch_bridge(monkeypatch):
@@ -563,7 +646,8 @@ def test_scan_recognized():
 
 
 def test_scan_ignores_comments():
-    assert srv._scan_script_for_unknown_funcs('% myfunc("x");') == []
+    # '#' is the LSF comment character on v202.
+    assert srv._scan_script_for_unknown_funcs('# myfunc("x");') == []
 
 
 def test_scan_ignores_string_literals_with_parens():
@@ -586,7 +670,7 @@ def test_scan_empty():
 # ---------------------------------------------------------------------------
 
 def test_tools_schema_valid():
-    assert len(srv.TOOLS) == 30 - len(srv._HIDDEN_TOOLS)
+    assert len(srv.TOOLS) == len(srv.SPECS) - len(srv._HIDDEN_TOOLS)
     for t in srv.TOOLS:
         assert t.name, 'tool without name'
         assert t.description, t.name
@@ -598,29 +682,237 @@ def test_tools_schema_valid():
 
 
 def test_tool_annotations_split():
+    """Annotations come from the spec table, not from a second hand-written set."""
     ro = {t.name for t in srv.TOOLS if t.annotations and t.annotations.readOnlyHint}
     ds = {t.name for t in srv.TOOLS if t.annotations and t.annotations.destructiveHint}
-    assert ro == srv._READ_ONLY_TOOLS
-    assert ds == srv._DESTRUCTIVE_TOOLS
+    assert ro == {s.name for s in srv.SPECS if s.read_only and not s.hidden}
+    assert ds == {s.name for s in srv.SPECS if s.destructive and not s.hidden}
     assert not (ro & ds)
 
 
 def test_dispatch_structural_consistency():
-    """30 tools = 29 bridge-dispatched + 1 server-only (no hidden tools)."""
+    """Every advertised tool is either bridge-dispatched or explicitly server-only."""
     assert len(srv.TOOLS) == (len(srv._DISPATCH) + len(srv._SERVER_ONLY_TOOLS)
                               - len(srv._HIDDEN_TOOLS))
-    assert srv._SERVER_ONLY_TOOLS == frozenset({'reference_lookup'})
+    assert srv._SERVER_ONLY_TOOLS == frozenset(
+        {'reference_lookup', 'engine_cleanup', 'library_list'})
     assert srv._HIDDEN_TOOLS == frozenset()
-    assert len(srv.TOOLS) == 30
+    assert len(srv.TOOLS) == len(srv.SPECS)
+
+
+# ---------------------------------------------------------------------------
+# Regression coverage for the fixes of this review pass
+# ---------------------------------------------------------------------------
+
+def test_engine_status_reports_code_identity(bs):
+    bs.fresh()
+    r = bs.send('engine_status', {})
+    st = r['result']
+    assert st['status'] == 'ok'
+    assert st['project_open'] is True
+    assert st['bridge_code_id']
+    assert st['disk_code_id']
+    # The test bridge is running the code that is on disk right now.
+    assert st['stale_code'] is False
+    assert 'note' not in st
+    assert st['recent_calls'], 'the call log should include earlier calls'
+    # The log holds completed calls: this one is appended once it returns.
+    assert 'session_new' in [c['method'] for c in st['recent_calls']]
+    assert st['fdtd_summary']['dimension'] == '3D'
+
+
+def test_engine_status_works_without_project(bs):
+    bs.send('session_close', {})
+    r = bs.send('engine_status', {})
+    assert r['result']['project_open'] is False
+    assert r['result']['status'] == 'ok'
+    bs.fresh()
+
+
+def test_execute_query_accepts_zero_arg_and_bare_args(bs):
+    bs.fresh()
+    # Bare (unquoted) argument stays a single string instead of being split.
+    r = bs.send('execute', {'code': '?getnamed("FDTD", dimension)'})
+    assert r['result']['result'] == '3D'
+    assert r['result']['query'] == 'getnamed'
+    # A bare name still resolves through getv/getnamed.
+    r = bs.send('execute', {'code': '?type'})
+    assert r['result']['result'] == 'ObjectModelRoot'
+    assert r['result']['query'] in ('getv', 'getnamed')
+
+
+def test_execute_rejects_script_set_with_space(bs):
+    """`set ("setup script", ...)` used to slip past the guard regex."""
+    bs.fresh()
+    r = bs.send('execute', {'code': 'set ("setup script", "x = 1;");'})
+    assert 'error' in r
+    assert 'model_script' in r['error']['message']
+
+
+def test_execute_query_explains_dead_commands(bs):
+    bs.fresh()
+    r = bs.send('execute', {'code': '?addvar("gap", 1)'})
+    assert 'error' in r
+    assert 'does not exist' in r['error']['message']
+    assert 'reference_lookup' in r['error']['message']
+
+
+def test_execute_autosave_ignores_commented_run(bs):
+    """A `# run ...` comment must not trigger the pre-solve autosave."""
+    bs.fresh()
+    r = bs.send('execute', {'code': '# run this later\naddrect();'})
+    assert r['result']['status'] == 'ok'
+    st = bs.send('engine_status', {})['result']
+    assert st['autosave_path'] is None
+
+    # ... whereas a real run() does autosave the project first.
+    r = bs.send('execute', {'code': 'run();'})
+    assert r['result']['status'] == 'ok'
+    st = bs.send('engine_status', {})['result']
+    assert st['autosave_path']
+
+
+def test_percent_lines_are_flagged_and_rejected(bs):
+    """`%` is not an LSF comment: warn at scan time, fail at run time."""
+    bs.fresh()
+    r = bs.send('execute', {'code': '% not a comment\naddrect();'})
+    assert 'error' in r, r
+    assert 'Failed to evaluate code' in r['error']['message']
+
+    # The advisory scanner catches it before the engine does.
+    warns = srv._percent_comment_warning('% oops\naddrect();')
+    assert warns and 'line(s) 1' in warns[0] and '#' in warns[0]
+    assert srv._percent_comment_warning('# fine\naddrect();') == []
+
+
+def test_result_list_all_reports_monitors_with_results(bs):
+    bs.fresh()
+    r = bs.send('result_list', {'all': True})
+    assert r['result']['monitor_count'] == 0
+
+    bs.send('model_add', {'type': 'power_monitor', 'name': 'm1'})
+    bs.send('run', {})
+    r = bs.send('result_list', {'all': True})
+    names = [m['monitor'] for m in r['result']['monitors']]
+    assert 'm1' in names
+
+
+def test_sweep_add_flags_unresolved_parameter_path(bs):
+    bs.fresh()
+    r = bs.send('sweep_add', {'name': 's1', 'type': 0, 'parameters': [
+        {'name': 'typo', 'parameter': '::model::nope::x span',
+         'start': 1e-6, 'stop': 2e-6}]})
+    assert r['result']['parameter_warnings'], r['result']
+    assert 'unresolved' in r['result']['parameter_warnings'][0]
+
+    bs.send('model_add', {'type': 'rectangle', 'name': 'r1'})
+    r = bs.send('sweep_add', {'name': 's2', 'type': 0, 'parameters': [
+        {'name': 'w', 'parameter': '::model::r1::x span',
+         'start': 1e-6, 'stop': 2e-6}]})
+    assert not r['result'].get('parameter_warnings'), r['result']
+
+
+def test_model_add_reports_property_failures(bs):
+    """model_add used to swallow every property error and still say ok."""
+    bs.fresh()
+    r = bs.send('model_add', {'type': 'rectangle', 'name': 'r1',
+                              'properties': {'x span': 2e-6, 'nope': 1}})
+    assert r['result']['status'] == 'ok'
+    assert r['result']['properties_failed'] == ['nope']
+    assert 'nope' in r['result']['failures']
+
+
+def test_session_new_reports_bad_config_key(bs):
+    bs.fresh()
+    r = bs.send('session_new', {'dimension': '3D', 'mesh accuracy': 4})
+    assert r['result']['status'] == 'ok'
+    assert r['result']['config']['mesh accuracy'] == 4
+    assert r['result']['session_generation'] >= 1
+
+
+def test_names_with_quotes_are_escaped_not_injected(bs):
+    """A quote in an object name must not break the generated LSF."""
+    bs.fresh()
+    weird = 'rect "quoted"'
+    r = bs.send('model_add', {'type': 'rectangle', 'name': weird})
+    assert r['result']['name'] == weird
+    r = bs.send('model_get', {'name': weird})
+    assert r['result']['type'] == 'Rectangle'
+    r = bs.send('model_delete', {'name': weird})
+    assert r['result']['status'] == 'ok'
+
+
+def test_model_set_reports_inactive_property_distinctly(bs):
+    """A property that exists but is inactive must not read as 'no such property'."""
+    bs.fresh()
+    bs.send('model_add', {'type': 'rectangle', 'name': 'r1'})
+    r = bs.send('model_set', {'name': 'r1', 'properties': {'mesh order': 3}})
+    assert r['result']['status'] == 'error'
+    reason = r['result']['failures']['mesh order']
+    assert 'inactive' in reason and 'override' in reason
+
+    # Switching the override on makes it writable (dict order is preserved).
+    r = bs.send('model_set', {'name': 'r1', 'properties': {
+        'override mesh order from material database': 1, 'mesh order': 3}})
+    assert r['result']['properties_set'] == 2
+    assert bs.send('model_get', {'name': 'r1'})['result']['mesh order'] == 3
+
+
+def test_model_parameters_and_results_are_analysis_entries(bs):
+    """::model parameters must land where the GUI shows them.
+
+    The model's "Edit analysis group" dialog lists ANALYSIS properties in its
+    Analysis > Variables table and addanalysisresult names in its Results table;
+    a user property created with adduserprop does not appear there.
+    """
+    bs.fresh()
+    r = bs.send('model_set', {'name': '::model',
+                              'properties': {'gap': 2e-7, 'nsub': 3},
+                              'property_types': {'gap': 'length'},
+                              'results': ['T_spectrum', 'R_spectrum']})
+    res = r['result']
+    assert res['status'] == 'ok', res
+    assert res['properties_set'] == 2
+    assert res['results_added'] == ['T_spectrum', 'R_spectrum']
+
+    q = bs.send('execute', {'code': '?queryanalysisprop("::model")'})['result']['result']
+    assert q['name'] == ['gap', 'nsub']
+    assert q['type'] == ['2', '0']
+    q = bs.send('execute', {'code': '?queryanalysisresult("::model")'})['result']['result']
+    assert q == ['T_spectrum', 'R_spectrum']
+
+
+def test_structure_group_parameters_use_user_props(bs):
+    bs.fresh()
+    bs.send('model_add', {'type': 'structure_group', 'name': 'g1'})
+    r = bs.send('model_set', {'name': 'g1', 'properties': {'period': 2e-7}})
+    assert r['result']['properties_set'] == 1
+    bs.send('execute', {'code': 'select("g1");'})
+    q = bs.send('execute', {'code': '?queryuserprop()'})['result']['result']
+    assert q['name'] == ['period']
+
+
+def test_declaring_an_existing_name_creates_a_suffixed_clone(bs):
+    """v202: addanalysisprop/adduserprop are not idempotent (documented pitfall)."""
+    bs.fresh()
+    bs.send('execute', {'code': 'select("::model"); addanalysisprop("dup", 2, 1e-7);'})
+    bs.send('execute', {'code': 'select("::model"); addanalysisprop("dup", 2, 2e-7);'})
+    q = bs.send('execute', {'code': '?queryanalysisprop("::model")'})['result']['result']
+    assert q['name'] == ['dup', 'dup2']
+
+
+def test_analysis_result_rejects_value_arguments(bs):
+    """addanalysisresult takes ONE argument on the model root on v202."""
+    bs.fresh()
+    r = bs.send('execute', {'code': 'select("::model"); addanalysisresult("x", 3);'})
+    assert 'error' in r
 
 
 # ---------------------------------------------------------------------------
 # BridgeClient FDTD_MCP_CALL_TIMEOUT path
 # ---------------------------------------------------------------------------
-
 def test_bridge_call_timeout(monkeypatch):
-    monkeypatch.setattr(srv, 'LUMERICAL_PYTHON', sys.executable)
-    monkeypatch.setattr(srv, 'BRIDGE_SCRIPT', _FAKE)
+    monkeypatch.setattr(srv, 'BRIDGE_ARGS', [sys.executable, _FAKE])
     monkeypatch.setattr(srv, '_CALL_TIMEOUT', 0.5)
     srv._bridge_started = False
     b = srv.BridgeClient()
@@ -640,8 +932,7 @@ def test_bridge_call_timeout(monkeypatch):
 
 
 def test_bridge_call_timeout_then_ensure_recovers(monkeypatch):
-    monkeypatch.setattr(srv, 'LUMERICAL_PYTHON', sys.executable)
-    monkeypatch.setattr(srv, 'BRIDGE_SCRIPT', _FAKE)
+    monkeypatch.setattr(srv, 'BRIDGE_ARGS', [sys.executable, _FAKE])
     monkeypatch.setattr(srv, '_CALL_TIMEOUT', 0.5)
     srv._bridge_started = False
     srv._ensure_bridge()
@@ -655,3 +946,67 @@ def test_bridge_call_timeout_then_ensure_recovers(monkeypatch):
         assert r == {'echo': {'ok': 1}}
     finally:
         srv._bridge.stop()
+
+
+# ---------------------------------------------------------------------------
+# Engine-process hygiene (orphaned fdtd-solutions.exe)
+# ---------------------------------------------------------------------------
+def test_bridge_closes_the_session_on_eof():
+    """EOF on stdin == the MCP server was recycled while a project was open.
+
+    The bridge used to exit(0) straight out of its stdin loop, leaving the
+    engine process running forever (the production leak: 7 orphaned engines,
+    every one with a dead bridge as its parent).
+    """
+    proc = subprocess.Popen(
+        [sys.executable, _RUNNER],
+        stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE, text=True, encoding='utf-8')
+    try:
+        assert json.loads(proc.stdout.readline())['ready'] is True
+        proc.stdin.write(json.dumps(
+            {'id': 1, 'method': 'session_new', 'params': {}}) + '\n')
+        proc.stdin.flush()
+        assert json.loads(proc.stdout.readline())['result']['status'] == 'ok'
+        proc.stdin.close()                      # server gone
+        proc.wait(timeout=30)
+        err = proc.stderr.read()
+        assert 'close() called' in err, err
+    finally:
+        if proc.poll() is None:
+            proc.kill()
+
+
+def test_engine_cleanup_sweeps_orphans_and_never_touches_foreign(monkeypatch):
+    table = [
+        {'pid': 1, 'ppid': 0, 'name': 'node.exe'},
+        {'pid': 100, 'ppid': 1, 'name': 'python.exe'},
+        {'pid': 300, 'ppid': 999, 'name': 'fdtd-solutions.exe'},   # orphan
+        {'pid': 400, 'ppid': 1, 'name': 'fdtd-solutions.exe'},     # foreign
+    ]
+    killed = []
+    monkeypatch.setattr(srv.proctree, 'process_table', lambda: table)
+    monkeypatch.setattr(srv.proctree, 'kill_pid',
+                        lambda pid, tree=True, wait=8.0: (killed.append(pid),
+                                                          (True, 'ok'))[1])
+    monkeypatch.setattr(srv, '_ORPHAN_SWEEP', True)
+    monkeypatch.setattr(srv, '_orphan_sweep_report', None)
+
+    dry = srv._handle_engine_cleanup({'dry_run': True})['result']
+    assert dry['would_kill'] == [300]
+    assert dry['kept_foreign'] == [400]
+    assert killed == [], 'dry run must not kill anything'
+
+    out = srv._handle_engine_cleanup({})['result']
+    assert killed == [300]
+    assert out['sweep']['counts']['foreign'] == 1
+    assert 400 not in [e['pid'] for e in out['sweep']['killed']]
+
+
+def test_server_status_reports_engine_processes(monkeypatch):
+    monkeypatch.setattr(srv.proctree, 'process_table', lambda: [
+        {'pid': 100, 'ppid': 999, 'name': 'fdtd-solutions.exe'}])
+    status = srv._engine_process_status()
+    assert status['counts']['orphan'] == 1
+    assert status['orphan_pids'] == [100]
+    assert 'never killed' in status['notes']['foreign']

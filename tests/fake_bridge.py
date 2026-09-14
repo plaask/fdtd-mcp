@@ -32,6 +32,16 @@ for line in sys.stdin:
         sys.stdout.write(json.dumps(resp) + '\n')
         sys.stdout.flush()
         continue
+    if req.get('method') == 'noise':
+        # Emit an id-less line (engine chatter) before the real response, to
+        # prove the client correlates by id instead of taking the next line.
+        sys.stdout.write(json.dumps({'note': 'engine chatter'}) + '\n')
+        sys.stdout.write('not json at all\n')
+        sys.stdout.flush()
+        resp = {'id': req.get('id'), 'result': {'echo': req.get('params', {})}}
+        sys.stdout.write(json.dumps(resp) + '\n')
+        sys.stdout.flush()
+        continue
     resp = {'id': req.get('id'), 'result': {'echo': req.get('params', {})}}
     sys.stdout.write(json.dumps(resp) + '\n')
     sys.stdout.flush()

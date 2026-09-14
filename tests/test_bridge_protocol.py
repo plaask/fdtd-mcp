@@ -31,7 +31,10 @@ def _run_requests(requests):
 
 def test_ready_handshake_and_unknown_method():
     out = _run_requests([{'id': 1, 'method': 'no_such_method', 'params': {}}])
-    assert out[0] == {'ready': True}
+    assert out[0].get('ready') is True
+    # The handshake also advertises which code generation answered, so a caller
+    # can tell whether a running bridge predates its edit.
+    assert out[0].get('code_id')
     assert out[1]['id'] == 1
     assert 'error' in out[1]
     assert 'Unknown method' in out[1]['error']['message']

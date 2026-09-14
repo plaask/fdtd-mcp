@@ -35,3 +35,16 @@ build-backend = "setuptools.build_meta"
 
 [tool.setuptools.package-data]
 fdtd_mcp = ["cheatsheet/*.json", "dispatch.json"]
+
+[tool.setuptools.packages.find]
+include = ["fdtd_mcp*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+# The default suite runs against tests/fake_engine.py and needs no Lumerical
+# installation. `-m "not live"` keeps the real-engine smoke test out of the way;
+# run it explicitly with FDTD_MCP_LIVE=1.
+addopts = "-m 'not live'"
+markers = [
+    "live: drives a real Lumerical engine (set FDTD_MCP_LIVE=1 and LUMERICAL_HOME)",
+]

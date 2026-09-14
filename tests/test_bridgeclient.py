@@ -13,8 +13,7 @@ _FAKE = str(Path(__file__).resolve().parent / 'fake_bridge.py')
 
 
 def _point_bridge_at_fake():
-    srv.LUMERICAL_PYTHON = sys.executable
-    srv.BRIDGE_SCRIPT = _FAKE
+    srv.BRIDGE_ARGS = [sys.executable, _FAKE]
 
 
 def test_roundtrip_and_shutdown():
@@ -63,3 +62,40 @@ def test_ensure_bridge_respawns_after_crash():
         assert r == {'echo': {'probe': 2}}
     finally:
         srv._bridge.stop()
+
+
+def test_restart_notice_is_reported_once():
+    """A restarted engine means lost in-memory state — say so, once."""
+    _point_bridge_at_fake()
+    b = srv.BridgeClient()
+    b.start()
+    try:
+        assert b.take_restart_notice() is None           # first start: no notice
+        b._proc.kill()
+        b._proc.wait()
+        b.start()                                        # simulated respawn
+        notice = b.take_restart_notice()
+        assert notice and 'restarted' in notice
+        assert b.take_restart_notice() is None           # one-shot
+    finally:
+        b.stop()
+
+
+def test_unsolicited_output_does_not_desync_responses():
+    """Id-less chatter must not be mistaken for the next call's answer."""
+    _point_bridge_at_fake()
+    b = srv.BridgeClient()
+    b.start()
+    try:
+        # 'noise' writes a JSON line without an id and a non-JSON line before
+        # its real response; both must be skipped.
+        r = b.call('noise', {'x': 1})
+        assert r == {'echo': {'x': 1}}
+        # ... and the following call must still line up.
+        r2 = b.call('anything', {'y': 2})
+        assert r2 == {'echo': {'y': 2}}
+        collected = b.unsolicited()
+        assert any('engine chatter' in line for line in collected)
+        assert any('not json' in line for line in collected)
+    finally:
+        b.stop()

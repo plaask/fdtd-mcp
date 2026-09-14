@@ -87,7 +87,7 @@ claude mcp add fdtd -- python -m fdtd_mcp.server
 
 通过 DSH 官方插件 `@deepseek-ai/dsh-mcp-client`（随每个 `dsh` 安装自带）桥接本
 MCP 服务器，工具以 `mcp__fdtd__*` 形式供 DSH 调用（如 `mcp__fdtd__execute`、
-`mcp__fdtd__run`、`mcp__fdtd__model_add`，共 30 个）。
+`mcp__fdtd__run`、`mcp__fdtd__model_add`，共 34 个）。
 
 **注册步骤：**
 
@@ -122,7 +122,7 @@ MCP 服务器，工具以 `mcp__fdtd__*` 形式供 DSH 调用（如 `mcp__fdtd__
 `$DSH_HOME/profiles/<name>/cordis.patch.yml`，或加到对所有 profile 生效的
 `$DSH_HOME/cordis.patch.yml` 即可。此集成与 Claude Code 的 `.mcp.json` 互不影响。
 
-## 工具（30 个，6 个模块）
+## 工具（34 个，7 个模块）
 
 ```
 session (5)     session_open, session_new, session_close,
@@ -139,10 +139,25 @@ sweep (6)       sweep_add, sweep_get, sweep_set, sweep_delete,
 
 result (4)      result_list, result_get, result_save, result_has
 
-engine (4)      run, execute, execute_file, reference_lookup
+engine (6)      run, execute, execute_file, reference_lookup, engine_status,
+                engine_cleanup
+
+library (2)     library_list, library_insert
 ```
 
-`run` / `sweep_run` 在求解前会自动把未保存的工程存到临时路径，避免隐藏引擎被 Lumerical 不可见的"Save As"对话框堵住。注意：`addvar` 在 v202 **已废弃**——模型变量需在 GUI 里建，否则 `sweep_add` 的参数路径（如 `::model>gap`）无法解析。
+`run` / `sweep_run` 在求解前会自动把未保存的工程存到临时路径，避免隐藏引擎被 Lumerical 不可见的"Save As"对话框堵住（临时路径不会冒充工程路径，`session_save()` 无参数时仍会提示未保存）。
+
+**v202 模型变量（参数）的创建方式**（已在真机验证）：`addvar`/`setvar`/`getvar` 在 v202 已被移除。正确做法是把 `::model` 选中后调用 `adduserprop("name", type_code, value)`（type_code 为整数：0=number, 1=text, 2=length, 3=time, 4=frequency, 5=material）；Analysis Group 用 `addanalysisprop`，Structure Group 用 `adduserprop`。`model_set` 已经自动完成这一步：
+
+```
+model_set(name="::model", properties={"gap": 200e-9})                 # 新建模型变量
+model_set(name="::model", properties={"gap": 200e-9},
+          property_types={"gap": "length"})                            # 指定 GUI 单位类型
+sweep_add(..., parameters=[{"name": "gap", "parameter": "::model::gap",
+                            "start": 100e-9, "stop": 300e-9, "points": 5}])
+```
+
+注意 `addsweepparameter` 不会校验参数路径是否存在——写错名字要等扫描运行时才报错，建议先 `model_get` 确认。
 
 | 模块 | 用途 | 工具 |
 |------|------|------|
@@ -151,7 +166,41 @@ engine (4)      run, execute, execute_file, reference_lookup
 | **material** | 材料数据库 | `material_add`, `material_get`, `material_set`, `material_delete`, `material_exists` |
 | **sweep** | 参数扫描生命周期 | `sweep_add`, `sweep_get`, `sweep_set`, `sweep_delete`, `sweep_run`, `sweep_result` |
 | **result** | 仿真数据 | `result_list`, `result_get`, `result_save`, `result_has` |
-| **engine** | 直接操作引擎 | `run`, `execute`, `execute_file`, `reference_lookup` |
+| **engine** | 直接操作引擎 | `run`, `execute`, `execute_file`, `reference_lookup`, `engine_status`, `engine_cleanup` |
+| **library** | Lumerical 对象库 | `library_list`, `library_insert` |
+
+### 对象库（结构组 / 分析组）
+
+`model_add` 只能建**空**组。安装自带的现成库元素共 129 个（`<LUMERICAL_HOME>/Resources/fdtd-library`，96 个 `Structures` + 33 个 `Analysis`）用 `library_insert` 插入，它封装了 Lumerical 的 `addobject("<catalog id>")`：把库元素的 `.fsp` 拷进来并**重跑其 setup 脚本**，所以库里的分析组插进来时监视器已经建好、analysis script 也完整。
+
+```
+library_list(type="Analysis")            → 33 个分析组（含分类）
+library_list(category="Gratings")        → 按分类过滤
+library_list(id="Qanalysis")             → 单个条目
+library_insert(name="Qanalysis")         → Analysis Group "Qanalysis" + 监视器 t1..t4
+library_insert(name="ring_resonator")    → Structure Group "ring resonator" + 8 个波导
+```
+
+id 就是 catalog 里的 id；插入后的对象沿用库元素自带名字（**含空格**，如 `"ring resonator"`）。真机实测：部分库元素本身就是基本体（如 `sphere`）；**未知 id 在引擎里是静默无效**的，所以 `library_insert` 会先按 `catalog.xml` 校验 id，再逐个核验对象确实存在（被引擎回滚时直接报错，而不是回 `ok`）。
+
+### 引擎进程卫生
+
+`lumapi.FDTD()` 把 `fdtd-solutions.exe` 生成为**桥进程的子进程**，而 Windows 不会因父进程死亡回收子进程——于是每次崩溃、超时或 MCP server 回收都会留下一个看不见的引擎，占着一个 ANSYS license seat 和几百 MB。现在引擎 pid 会被记录并加入 kill-on-close 的 job object（桥被强杀也会带走引擎），桥在 EOF 路径上主动关会话，上一代 server 留下的僵尸引擎在启动时清扫。分类是安全规则：
+
+| 类别 | 含义 | 处理 |
+|------|------|------|
+| `owned` / `bridge` | 本会话的引擎 | 关闭/重启会话时释放 |
+| `orphan` | 父进程已消失——再也无法访问 | **可安全杀掉**，启动时自动清扫 |
+| `foreign` | 其他活着的客户端（如你开的 Lumerical GUI） | **绝不触碰** |
+
+```
+engine_status()                          → engine_processes: owned/orphan/foreign +
+                                           stale_code（桥是否还在跑旧代码）
+engine_cleanup(dry_run=true)             → 先看会杀谁
+engine_cleanup(restart_bridge=true)      → 引擎卡死时换新桥+新引擎
+```
+
+设 `FDTD_MCP_ORPHAN_SWEEP=0` 可关闭启动清扫。
 
 ## 使用示例
 
@@ -245,6 +294,19 @@ model_get("source_1")                  → 显式类型 + source_kind 判别器
                                          对无法识别的函数名返回非阻塞警告
 ```
 
+### 诊断：「我改的代码到底生效了没？」
+
+```
+engine_status()
+  → {bridge_code_id, disk_code_id, stale_code, project_path, autosave_path,
+     session_generation, engine: {install_version, verified_against},
+     recent_calls: [...], server: {server_code_id, tool_count, ...}}
+```
+
+`stale_code: true` 表示正在运行的桥进程还是旧代码——桥侧改动（`bridge.py`、
+`handlers/`、`engine/`）必须等该进程重启才会生效。这个工具在没打开工程时也能调用，
+并返回最近 50 次调用（方法、耗时、错误）。
+
 ## 文件结构
 
 ```
@@ -257,13 +319,50 @@ fdtd-mcp/
 ├── fdtd_mcp/
 │   ├── __init__.py
 │   ├── discovery.py   # Lumerical 路径自动发现
+│   ├── toolspec.py    # 声明式工具目录（schema/描述/注解/默认值/超时类别）
 │   ├── dispatch.json  # 工具名 -> bridge handler 的唯一映射表
-│   ├── bridge.py      # JSON-RPC 桥接（Lumerical Python 3.6.8）
+│   ├── bridge.py      # JSON-RPC 桥接外壳（Lumerical Python 3.6.8）
+│   ├── engine/        # 桥侧基础设施（Python 3.6.8）
+│   │   ├── constants.py      # 上限、LSF 事实、run() 正则
+│   │   ├── errors.py         # BridgeError 统一错误通道
+│   │   ├── lsf.py            # 引号转义、临时变量、?expr 解析
+│   │   ├── capabilities.py   # 实测引擎能力表 + 代码指纹
+│   │   ├── proctree.py       # 引擎进程账本（owned/orphan/foreign、job object、
+│   │   │                     #   TerminateProcess 强杀）
+│   │   ├── library.py        # 对象库目录（Resources/fdtd-library）
+│   │   └── base.py           # 共享 mix-in（_call_lsf / 清洗 / 名称解析）
+│   ├── handlers/      # 按模块拆分的处理器：session/model/material/sweep/
+│   │                  #   result/library/engine_tools
 │   ├── server.py      # MCP 服务器（系统 Python）
 │   └── cheatsheet/
-│       └── lumapi_ref.json  # 32 条 Lumerical API 参考
-└── tests/             # pytest 测试（无需 Lumerical）
+│       └── lumapi_ref.json  # Lumerical API 参考（每条带 verified_against）
+└── tests/
+    ├── test_*.py            # 基于 fake engine 的 pytest（无需 Lumerical）
+    ├── test_capability_guard.py  # 代码 / 能力表 / 白名单 一致性
+    ├── test_toolspec.py     # 声明式工具目录自洽性
+    ├── test_proctree.py     # 哪些引擎进程允许被杀（foreign 绝不误杀）
+    ├── test_engine_reaping.py    # 会话切换/退出不留孤儿引擎
+    ├── test_library.py      # 对象库目录与插入（fake 与真机布局一致）
+    ├── run_bridge_live.py   # 真机冒烟（需要许可）
+    ├── live_orphan_check.py # 真机：EOF / 硬杀 / 正常关闭都不留引擎
+    └── test_live_smoke.py   # 上面脚本的 pytest 包装（FDTD_MCP_LIVE=1）
 ```
+
+## 测试
+
+```
+python -m pytest tests -q                                        # 离线套件（fake engine）
+$env:FDTD_MCP_LIVE=1; python -m pytest tests/test_live_smoke.py  # 真机冒烟
+"%LUMERICAL_HOME%\python-3.6.8-embed-amd64\python.exe" tests/run_bridge_live.py
+```
+
+## 改动何时生效
+
+| 改了什么 | 何时生效 |
+|---|---|
+| `handlers/*`、`engine/*`、`bridge.py` | **桥进程**重启后（超时/崩溃后被自动重启，或 MCP server 重启）。`engine_status()` 的 `stale_code` 可直接判断 |
+| `server.py`、`toolspec.py`、`dispatch.json`、`cheatsheet/*.json` | **MCP server 进程**重启后（重载 DSH patch 层，或重启 `dsh web`） |
+| `tests/*`、`README*` | 立即 |
 
 ## 依赖
 

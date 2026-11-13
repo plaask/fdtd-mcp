@@ -38,6 +38,16 @@ def test_parse_normal_autoshutoff(tmp_path):
     assert d['autoshutoff'] == 8.2e-06
 
 
+def test_parse_iteration_wording(tmp_path):
+    p = tmp_path / 'sim_p0.log'
+    p.write_text('Starting 3147 total iterations\n'
+                 'Completed 101 iterations, or 6.4e-15s of Simulation Time\n',
+                 encoding='utf-8')
+    d = _parse_engine_log(str(p))
+    assert d['step'] == 101
+    assert d['total_steps'] == 3147
+
+
 def test_autoshutoff_prefers_from_to_target():
     assert _autoshutoff_from_line('Auto Shutoff from 0.02 to 5108') == 5108.0
     assert _autoshutoff_from_line('autoshutoff level: 1e-05') == 1e-05

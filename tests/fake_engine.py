@@ -504,6 +504,9 @@ class FakeFDTD(object):
 
         if func_name == 'getnamed':
             obj = self._resolve(args[0])
+            if len(args) == 1:
+                # v202: getnamed(obj) returns the property-name list.
+                return '\n'.join(sorted(set(obj.props) | {'type'}))
             prop = args[1]
             if prop == 'type':
                 return obj.type
@@ -874,6 +877,9 @@ class FakeFDTD(object):
 
         if func_name == 'runsweep':
             self.runsweep(args[0])
+            return None
+
+        if func_name == 'resume':
             return None
 
         self._eval_log.append('FAKE-UNSUPPORTED: %s%r' % (func_name, args))

@@ -25,10 +25,70 @@ DEAD_COMMANDS = frozenset([
     'addvar', 'addvarfdtd', 'setvar', 'getvar',
     'findresult', 'hasresult', 'listresults',
     'adddftmonitor', 'addfield',
+    'farfield', 'farfieldpolar',
 ])
 
 # Verified metadata source for the facts above (kept for the status tool).
-VERIFIED_AGAINST = 'Lumerical v202 (2020 R2), live engine probes 2026-09'
+VERIFIED_AGAINST = 'Lumerical v202 (2020 R2), live engine probes 2026-09/2026-11'
+
+# ---------------------------------------------------------------------------
+# Object-type registry — the single source for "which model_add type maps to
+# which LSF adder". toolspec (enum), handlers/model.py (dispatch), the fake
+# engine consistency test and the scanner-allowlist test all derive from this.
+# Verified live on v202 in 2026-11 (see docs/verified/v202.md §8/§9).
+# ---------------------------------------------------------------------------
+OBJECT_TYPES = {
+    # Structures
+    'rectangle': {'add': 'addrect', 'type': 'Rectangle', 'group': 'Structures', 'since': 'v202'},
+    'circle': {'add': 'addcircle', 'type': 'Circle', 'group': 'Structures', 'since': 'v202'},
+    'ring': {'add': 'addring', 'type': 'Ring', 'group': 'Structures', 'since': 'v202'},
+    'polygon': {'add': 'addpoly', 'type': 'Polygon', 'group': 'Structures', 'since': 'v202'},
+    'sphere': {'add': 'addsphere', 'type': 'Sphere', 'group': 'Structures', 'since': 'v202'},
+    'pyramid': {'add': 'addpyramid', 'type': 'Pyramid', 'group': 'Structures', 'since': 'v202'},
+    'triangle': {'add': 'addtriangle', 'type': 'Triangle', 'group': 'Structures', 'since': 'v202'},
+    'waveguide': {'add': 'addwaveguide', 'type': 'Waveguide', 'group': 'Structures', 'since': 'v202'},
+    'custom': {'add': 'addcustom', 'type': 'Custom', 'group': 'Structures', 'since': 'v202'},
+    'planar_solid': {'add': 'addplanarsolid', 'type': 'Planar Solid', 'group': 'Structures', 'since': 'v202'},
+    # Simulation
+    'fdtd': {'add': 'addfdtd', 'type': 'FDTD', 'group': 'Simulation', 'since': 'v202'},
+    'mesh': {'add': 'addmesh', 'type': 'Mesh', 'group': 'Simulation', 'since': 'v202'},
+    'stack': {'add': 'addstack', 'type': 'STACK', 'group': 'Simulation', 'since': 'v202',
+              'notes': 'STACK solver object; running it requires a STACK license'},
+    # Sources
+    'dipole': {'add': 'adddipole', 'type': 'Dipole', 'group': 'Sources', 'since': 'v202'},
+    'tfsf': {'add': 'addtfsf', 'type': 'TFSF', 'group': 'Sources', 'since': 'v202'},
+    'plane': {'add': 'addplane', 'type': 'Plane Wave', 'group': 'Sources', 'since': 'v202'},
+    'gaussian': {'add': 'addgaussian', 'type': 'Gaussian', 'group': 'Sources', 'since': 'v202'},
+    'mode_source': {'add': 'addmode', 'type': 'Mode Source', 'group': 'Sources', 'since': 'v202'},
+    # Monitors
+    'power_monitor': {'add': 'addpower', 'type': 'Power Monitor', 'group': 'Monitors', 'since': 'v202'},
+    'dft_monitor': {'add': 'addpower', 'type': 'Power Monitor', 'group': 'Monitors', 'since': 'v202',
+                    'notes': 'addpower object configured through monitor type/output flags'},
+    'field_monitor': {'add': 'addpower', 'type': 'Power Monitor', 'group': 'Monitors', 'since': 'v202',
+                      'notes': 'addpower object configured through monitor type/output flags'},
+    'index_monitor': {'add': 'addindex', 'type': 'Index Monitor', 'group': 'Monitors', 'since': 'v202'},
+    'movie_monitor': {'add': 'addmovie', 'type': 'Movie Monitor', 'group': 'Monitors', 'since': 'v202'},
+    'mode_expansion': {'add': 'addmodeexpansion', 'type': 'Mode Expansion Monitor',
+                       'group': 'Monitors', 'since': 'v202'},
+    # Groups / containers
+    'structure_group': {'add': 'addstructuregroup', 'type': 'Structure Group', 'group': 'Groups', 'since': 'v202'},
+    'analysis_group': {'add': 'addanalysisgroup', 'type': 'Analysis Group', 'group': 'Groups', 'since': 'v202'},
+    'container_group': {'add': 'addgroup', 'type': 'Container Group', 'group': 'Groups', 'since': 'v202'},
+    'layer_builder': {'add': 'addlayerbuilder', 'type': 'Layer Builder', 'group': 'Build', 'since': 'v202'},
+    # Port
+    'port': {'add': 'addport', 'type': 'Port', 'group': 'Port', 'since': 'v202',
+             'prereq': 'fdtd'},
+}
+
+
+def object_add_command(name):
+    """LSF adder for a model_add type, or None when unknown."""
+    spec = OBJECT_TYPES.get(name)
+    return spec['add'] if spec else None
+
+
+def supported_object_types():
+    return sorted(OBJECT_TYPES)
 
 # Which declaration command each object type accepts for a NEW property.
 # Verified live on v202:

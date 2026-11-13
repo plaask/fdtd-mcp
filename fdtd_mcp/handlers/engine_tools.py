@@ -10,8 +10,9 @@ import re
 import time
 
 from ..engine.base import BridgeBase
-from ..engine.capabilities import (DEAD_COMMANDS, VERIFIED_AGAINST, code_id,
-                                   code_id_of, engine_facts)
+from ..engine.capabilities import (DEAD_COMMANDS, OBJECT_TYPES,
+                                   VERIFIED_AGAINST, code_id, code_id_of,
+                                   engine_facts)
 from ..engine.constants import ERR_MSG as _ERR_MSG
 from ..engine.constants import RUN_COMMAND as _RUN_RE
 from ..engine.errors import BridgeError
@@ -221,6 +222,7 @@ class EngineHandlers(BridgeBase):
             'disk_code_id': disk_id,
             'stale_code': bool(disk_id and disk_id != running),
             'verified_against': VERIFIED_AGAINST,
+            'supported_object_types': sorted(OBJECT_TYPES),
             'calls_handled': getattr(self, '_calls', 0),
             'lsf_calls': getattr(self, '_lsf_call_count', 0),
             'engine': engine_facts(),

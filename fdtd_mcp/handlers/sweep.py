@@ -377,11 +377,13 @@ class SweepHandlers(BridgeBase):
     def _cmd_sweep_run(self, p):
         self._require_project()
         saved = self._ensure_project_saved()
+        started = time.time()
         try:
             self._fsp.runsweep(p['name'])
         except Exception as e:
             raise BridgeError('sweep_run failed: %s' % str(e)[:_ERR_MSG])
-        return self._run_result(saved)
+        # Best-effort: queued/remote sweeps may not have written a log yet.
+        return self._run_result(saved, started)
 
     def _cmd_sweep_result(self, p):
         self._require_project()

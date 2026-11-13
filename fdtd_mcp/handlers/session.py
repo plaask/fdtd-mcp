@@ -40,6 +40,8 @@ _AUTOSHUTOFF_FROM_TO_RE = re.compile(
 _AUTOSHUTOFF_RE = re.compile(
     r'(?i)auto\s*shutoff(?:\s*level)?\s*[:=]?\s*([0-9eE+\-.]+)')
 _STEP_RE = re.compile(r'\b(\d+)\s*/\s*(\d+)\s*(?:time\s*)?steps\b', re.I)
+_TOTAL_ITER_RE = re.compile(r'(?i)starting\s+(\d+)\s+total\s+iterations?')
+_DONE_ITER_RE = re.compile(r'(?i)completed\s+(\d+)\s+iterations?')
 
 
 def _redact_log_line(line):
@@ -105,6 +107,18 @@ def _parse_engine_log(path):
             try:
                 step = int(m.group(1))
                 total_steps = int(m.group(2))
+            except ValueError:
+                pass
+        m = _TOTAL_ITER_RE.search(line)
+        if m:
+            try:
+                total_steps = int(m.group(1))
+            except ValueError:
+                pass
+        m = _DONE_ITER_RE.search(line)
+        if m:
+            try:
+                step = int(m.group(1))
             except ValueError:
                 pass
 
@@ -255,6 +269,7 @@ class SessionHandlers(BridgeBase):
         self._track_engine()
         self._path = path
         self._autosave_path = None
+        self._seen_objects = set()
         self._session_generation = getattr(self, '_session_generation', 0) + 1
 
     def _cmd_session_open(self, p):
@@ -277,6 +292,7 @@ class SessionHandlers(BridgeBase):
         self._fsp = None
         self._path = None
         self._autosave_path = None
+        self._seen_objects = set()
         reaped = self._reap_engines()
         result = {'status': 'closed'}
         if reaped.get('killed') or reaped.get('failed'):

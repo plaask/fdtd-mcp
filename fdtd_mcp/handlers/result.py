@@ -63,7 +63,12 @@ class ResultHandlers(BridgeBase):
             monitors = self._monitors_with_results()
             if monitors:
                 return {'monitors': monitors, 'monitor_count': len(monitors),
-                        'note': 'Pass monitor="<name>" to list its datasets.'}
+                        'orphan_count': sum(1 for m in monitors
+                                            if m.get('orphan')),
+                        'note': 'Pass monitor="<name>" to list its datasets. '
+                                'orphan=true marks a result whose object is no '
+                                'longer in the model tree (best-effort: only '
+                                'names this bridge has traversed are known).'}
             return {'monitors': [], 'monitor_count': 0,
                     'note': 'No object currently returns results — run the '
                             'simulation first. (v202 haveresult is true for '
@@ -144,6 +149,29 @@ class ResultHandlers(BridgeBase):
             if datasets:
                 entry['datasets'] = [d.strip() for d in str(datasets).split('\n')
                                      if d.strip()]
+            monitors.append(entry)
+
+        # Best-effort orphan detection: objects seen by an earlier traversal
+        # that are no longer in the tree but still return results. v202 has no
+        # API to enumerate result holders, so this can only catch names this
+        # bridge has actually seen (documented in the reply).
+        current = set(m['monitor'] for m in monitors)
+        for name in sorted(getattr(self, '_seen_objects', set()) - current):
+            datasets = None
+            for candidate in self._result_name_candidates(name):
+                try:
+                    datasets = self._call_lsf('getresult', candidate)
+                    break
+                except Exception:
+                    continue
+            if not datasets:
+                continue
+            entry = {'monitor': name, 'type': '?', 'orphan': True}
+            try:
+                entry['datasets'] = [d.strip() for d in str(datasets).split('\n')
+                                     if d.strip()]
+            except Exception:
+                pass
             monitors.append(entry)
         return monitors
 

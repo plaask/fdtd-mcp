@@ -768,8 +768,7 @@ _LSF_BUILTINS = frozenset({
     'clearresults', 'clearanalysis',
     'haveresult',
     # Farfield / transmission
-    'farfield', 'farfield3d', 'farfieldpolar',
-    'farfieldpolar2d', 'farfieldpolar3d',
+    'farfield3d', 'farfieldpolar2d', 'farfieldpolar3d',
     'transmission', 'dipolepower',
     # Analysis / setup run
     'runsetup', 'runanalysis',

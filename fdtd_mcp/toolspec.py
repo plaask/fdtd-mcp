@@ -15,6 +15,12 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 
+from .engine.capabilities import OBJECT_TYPES
+
+# The model_add enum is generated from the same registry the bridge dispatches
+# from, so adding an object type is one edit (engine/capabilities.py).
+_MODEL_ADD_TYPES = sorted(OBJECT_TYPES)
+
 
 @dataclass(frozen=True)
 class ToolSpec(object):
@@ -197,14 +203,7 @@ SPECS = [
 'Add ANY object to the model tree.\n'
         '\n'
         'Supported types (v202-verified):\n'
-        '  rectangle, circle, ring, polygon, sphere, pyramid, triangle, waveguide,\n'
-        '  custom, planar_solid\n'
-        '  fdtd, mesh, stack\n'
-        '  dipole, tfsf, plane, gaussian, mode_source\n'
-        '  power_monitor, dft_monitor, index_monitor, field_monitor, movie_monitor,\n'
-        '  mode_expansion\n'
-        '  structure_group, analysis_group, container_group, layer_builder\n'
-        '  port\n'
+        '  ' + ', '.join(_MODEL_ADD_TYPES) + '\n'
         '\n'
         'Prerequisites:\n'
         '  port             requires an FDTD solver region (add type="fdtd" first);\n'
@@ -223,12 +222,7 @@ SPECS = [
         ),
         schema={'type':'object','properties':{
         'type':{'type':'string','description':'Object type to create',
-            'enum':['rectangle','circle','ring','polygon','sphere','pyramid','triangle',
-                    'waveguide','custom','planar_solid','fdtd','mesh','stack',
-                    'dipole','tfsf','plane','gaussian','mode_source',
-                    'power_monitor','dft_monitor','index_monitor','field_monitor',
-                    'movie_monitor','mode_expansion','structure_group',
-                    'analysis_group','container_group','layer_builder','port']},
+            'enum': _MODEL_ADD_TYPES},
         'name':{'type':'string','description':'Optional name (auto-generated if omitted)'},
         'properties':{'type':'object','description':'Optional property dict to set after creation'},
         'property_types':{'type':'object',
@@ -240,17 +234,25 @@ SPECS = [
         name='model_get',
         module='model',
         description=(
-'Get full info for ONE named object: all properties, scripts (if group/::model),\n'
-        'variables (if group/::model), user-declared properties (model variables and\n'
-        'group parameters), children (if group).\n'
+'Get full info for ONE named object: the curated geometry/material/scene\n'
+        'properties, scripts (if group/::model), variables (if group/::model),\n'
+        'user-declared properties (model variables and group parameters), children\n'
+        '(if group).\n'
         '\n'
-        'Example:\n'
+        'Set include_all_properties=true to also read every property name returned\n'
+        'by getnamed(obj) — this mirrors the GUI Edit dialog but can be large.\n'
+        '\n'
+        'Examples:\n'
         '  model_get(name="source_1")\n'
-        '    -> {type: "Dipole", amplitude: 1.0, ...}'
+        '    -> {type: "Dipole", amplitude: 1.0, ...}\n'
+        '  model_get(name="my_rect", include_all_properties=true)'
         ),
         schema={'type':'object','properties':{
-        'name':{'type':'string','description':'Object name (required)'}},
+        'name':{'type':'string','description':'Object name (required)'},
+        'include_all_properties':{'type':'boolean',
+            'description':'Read every getnamed(obj) property (default false)'}},
         'required':['name']},
+        defaults={'include_all_properties': False},
         read_only=True,
     ),
     ToolSpec(
@@ -633,9 +635,13 @@ SPECS = [
         name='sweep_run',
         module='sweep',
         description=(
-'Run a parameter sweep by name. Blocks until completion.\n'
+'Run a parameter sweep by name. Blocks until the engine returns from\n'
+        'runsweep (local sweeps complete; queued/remote jobs may return early).\n'
         'timeout (seconds) bounds the wait; on expiry the engine is '
         'restarted (set 0 to wait forever, default from FDTD_MCP_CALL_TIMEOUT).\n'
+        '\n'
+        'diagnostics is best-effort: it parses the engine log if one was\n'
+        'written; for queued/remote sweeps it may report log_found=false.\n'
         '\n'
         'Example:\n'
         '  sweep_run(name="gap_sweep")'
@@ -747,7 +753,12 @@ SPECS = [
         description=(
 'Run the FDTD simulation once. Blocks until completion.\n'
         'timeout (seconds) bounds the wait; on expiry the engine is '
-        'restarted (set 0 to wait forever, default from FDTD_MCP_CALL_TIMEOUT).'
+        'restarted (set 0 to wait forever, default from FDTD_MCP_CALL_TIMEOUT).\n'
+        '\n'
+        'FDTD writes the results into the current .fsp (engine behaviour, not\n'
+        'an extra save). diagnostics is parsed from <project>_p0.log and reports\n'
+        'diverged, early_termination, autoshutoff, step/total_steps, errors,\n'
+        'warnings and log_tail; log_found=false means no log was found.'
         ),
         schema={'type':'object','properties':{
         'timeout':{'type':'number','description':'Optional wait bound in seconds (0 = no timeout)'}}},

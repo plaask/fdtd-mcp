@@ -16,7 +16,7 @@ from ..engine.constants import (ERR_MSG as _ERR_MSG,
                                RUN_COMMAND as _RUN_COMMAND)
 from ..engine.base import BridgeBase
 from ..engine.capabilities import (ANALYSIS_RESULT_FUNCTION,
-                                   user_prop_function)
+                                   OBJECT_TYPES, user_prop_function)
 from ..engine.errors import BridgeError
 from ..engine.lsf import lsf_quote
 
@@ -100,6 +100,10 @@ class ModelHandlers(BridgeBase):
                                                  enabled_only, result_list, seen)
                         continue
                 result_list.append(obj)
+                try:
+                    self._seen_objects.add(obj_id)
+                except AttributeError:
+                    pass
                 if str(t) in ('Structure Group', 'Analysis Group'):
                     self._traverse_scope(scope + '::' + obj_id, prop_list,
                                          enabled_only, result_list, seen)
@@ -343,6 +347,7 @@ class ModelHandlers(BridgeBase):
         """
         self._require_project()
         name = self._resolve_name(p['name'])
+        include_all = bool(p.get('include_all_properties', False))
         out = {'name': name}
         try:
             t = self._call_lsf('getnamed', name, 'type')
@@ -367,6 +372,24 @@ class ModelHandlers(BridgeBase):
                 out[uprop] = self._sanitize(self._call_lsf('getnamed', name, uprop))
             except Exception:
                 pass
+        if include_all:
+            # v202's getnamed(name) with no property returns the full property
+            # name list; read each one so model_get can mirror the Edit dialog.
+            try:
+                raw = self._call_lsf('getnamed', name)
+                all_props = [x.strip() for x in str(raw or '').split('\n')
+                             if x.strip()]
+            except Exception:
+                all_props = []
+            for prop in all_props:
+                if prop in out:
+                    continue
+                try:
+                    out[prop] = self._sanitize(
+                        self._call_lsf('getnamed', name, prop))
+                except Exception:
+                    pass
+            out['all_properties_count'] = len(all_props)
         # For groups and ::model, also include scripts and variables
         t_str = out.get('type', str(t)) if 'type' in out else ''
         if name == '::model' or t_str in ('Analysis Group', 'Structure Group'):
@@ -392,42 +415,19 @@ class ModelHandlers(BridgeBase):
         properties = p.get('properties', {})
         scope = p.get('scope', '::model')
 
-        # Map type string to Lumerical add* function.
-        # Verified live on v202: the only monitor adders are addpower, addindex,
-        # addmovie and addprofile — addfield and adddftmonitor do not exist, so
-        # every frequency-domain monitor (power / DFT / field) is added with
-        # addpower and configured through "monitor type" + its output switches.
-        TYPE_MAP = {
-            'rectangle': 'addrect', 'circle': 'addcircle', 'ring': 'addring',
-            'polygon': 'addpoly', 'sphere': 'addsphere', 'pyramid': 'addpyramid',
-            'triangle': 'addtriangle', 'waveguide': 'addwaveguide',
-            'fdtd': 'addfdtd', 'mesh': 'addmesh',
-            'dipole': 'adddipole', 'tfsf': 'addtfsf', 'plane': 'addplane',
-            'gaussian': 'addgaussian', 'mode_source': 'addmode',
-            'power_monitor': 'addpower', 'dft_monitor': 'addpower',
-            'field_monitor': 'addpower',
-            'index_monitor': 'addindex',
-            'movie_monitor': 'addmovie',
-            'structure_group': 'addstructuregroup',
-            'analysis_group': 'addanalysisgroup',
-            # v202-verified adders (2026-11): the GUI groups Port / Monitors /
-            # Groups / Structures / Simulation expose these too.
-            'port': 'addport',
-            'mode_expansion': 'addmodeexpansion',
-            'container_group': 'addgroup',
-            'custom': 'addcustom',
-            'planar_solid': 'addplanarsolid',
-            'stack': 'addstack',
-            'layer_builder': 'addlayerbuilder',
-        }
-        func = TYPE_MAP.get(obj_type)
-        if not func:
+        # Single source: engine/capabilities.py::OBJECT_TYPES. Verified live on
+        # v202 that addfield/adddftmonitor do not exist; every frequency-domain
+        # monitor (power / DFT / field) is an addpower object configured through
+        # "monitor type" + its output switches.
+        spec = OBJECT_TYPES.get(obj_type)
+        if not spec:
             raise RuntimeError('Unknown object type: ' + obj_type +
-                               '. Use one of: ' + ', '.join(sorted(TYPE_MAP.keys())))
+                               '. Use one of: ' + ', '.join(sorted(OBJECT_TYPES)))
+        func = spec['add']
 
         # Verified live on v202: a port is a child of the FDTD solver's
         # "ports" group, so addport fails without a solver region.
-        if obj_type == 'port':
+        if spec.get('prereq') == 'fdtd':
             try:
                 self._call_lsf('getnamed', 'FDTD', 'type')
             except Exception:

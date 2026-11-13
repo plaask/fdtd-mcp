@@ -105,6 +105,7 @@ class FdtdBridge(SessionHandlers, ModelHandlers, MaterialHandlers,
         self._engine_pids = []            # engine processes launched by us
         self._engine_job = None           # kill-on-close job binding (if any)
         self._trace = deque(maxlen=_TRACE_LIMIT)
+        self._seen_objects = set()        # names seen by model_info/traverse
         # Derive the dispatch table from dispatch.json; fail fast if a
         # referenced method has no _cmd_<method> handler on this class.
         self._method_map = {}

@@ -26,11 +26,12 @@
       "field_name": "e.g. 'Ex', 'Ez', 'T', 'R', 'x', 'y', 'z'"
     },
     "common_pitfalls": [
+      "Verified live on v202 (2026-11): the command exists; in layout mode it reports \"the d-card named ... was not found\" and tells you to run first",
       "getdata returns a raw array, not a dataset — preferred when you want just one field",
       "getresult + getv(dataset.field) is equivalent but returns the whole dataset"
     ],
     "category": "result",
-    "verified_against": "pending"
+    "verified_against": "v202 - live engine probes 2026-11"
   },
   "getnamed": {
     "signature": "getnamed(\"object_name\", \"property_name\")",
@@ -97,7 +98,7 @@
       "Configure via setnamed or set_parameter tool after creation"
     ],
     "category": "object",
-    "verified_against": "pending"
+    "verified_against": "v202 - live engine probes 2026-11"
   },
   "addcircle": {
     "signature": "addcircle()",
@@ -107,7 +108,7 @@
       "Same pattern as addrect — auto-named, configure after creation"
     ],
     "category": "object",
-    "verified_against": "pending"
+    "verified_against": "v202 - live engine probes 2026-11"
   },
   "addtfsf": {
     "signature": "addtfsf()",
@@ -118,7 +119,7 @@
       "Configure direction, wavelength range, injection axis via setnamed after creation"
     ],
     "category": "source",
-    "verified_against": "pending"
+    "verified_against": "v202 - live engine probes 2026-11"
   },
   "addgaussian": {
     "signature": "addgaussian()",
@@ -129,7 +130,7 @@
       "For dipole sources use adddipole(), for plane waves use addplane()"
     ],
     "category": "source",
-    "verified_against": "pending"
+    "verified_against": "v202 - live engine probes 2026-11"
   },
   "addplane": {
     "signature": "addplane()",
@@ -140,7 +141,7 @@
       "May not exist in all Lumerical versions — use addtfsf if addplane is unavailable"
     ],
     "category": "source",
-    "verified_against": "pending"
+    "verified_against": "v202 - live engine probes 2026-11"
   },
   "adddipole": {
     "signature": "adddipole()",
@@ -151,7 +152,7 @@
       "Set dipole type (Electric/Magnetic) and polarization angle after creation via setnamed"
     ],
     "category": "source",
-    "verified_against": "pending"
+    "verified_against": "v202 - live engine probes 2026-11"
   },
   "addpower": {
     "signature": "addpower()",
@@ -162,7 +163,7 @@
       "Set monitor type (2D/3D/1D), output flags via setnamed after creation"
     ],
     "category": "monitor",
-    "verified_against": "pending"
+    "verified_against": "v202 - live engine probes 2026-11"
   },
   "addmesh": {
     "signature": "addmesh()",
@@ -173,7 +174,7 @@
       "Set dx/dy/dz via setnamed for mesh size override"
     ],
     "category": "mesh",
-    "verified_against": "pending"
+    "verified_against": "v202 - live engine probes 2026-11"
   },
   "addmaterial": {
     "signature": "addmaterial(\"model_type\")",
@@ -385,7 +386,7 @@
     "verified_against": "proven — used in _cmd_get_sweep_info"
   },
   "farfield": {
-    "signature": "farfield()  (exact behavior PENDING verification)",
+    "signature": "NOT AVAILABLE in v202 — 'farfield is not a valid function or variable name'. Use farfield3d / farfieldpolar3d for far-field projection.",
     "returns": "none (performs far-field projection on selected monitor in analysis mode)",
     "valid_args": {},
     "common_pitfalls": [
@@ -394,7 +395,7 @@
       "Results accessed via farfield3d() / farfieldpolar() after farfield() call"
     ],
     "category": "analysis",
-    "verified_against": "pending"
+    "verified_against": "v202 - live engine probe 2026-11 (dead)"
   },
   "farfield3d": {
     "signature": "farfield3d()  (exact behavior PENDING verification)",
@@ -405,10 +406,10 @@
       "Returns angular distribution data"
     ],
     "category": "analysis",
-    "verified_against": "pending"
+    "verified_against": "v202 - live engine probes 2026-11"
   },
   "farfieldpolar": {
-    "signature": "farfieldpolar(\"monitor_name\", ...)  (exact signature PENDING verification)",
+    "signature": "NOT AVAILABLE in v202 — 'farfieldpolar is not a valid function or variable name'. Use farfieldpolar2d / farfieldpolar3d instead.",
     "returns": "polar far-field data array (angle, amplitude, phase)",
     "valid_args": {
       "monitor_name": "name of the far-field monitor"
@@ -418,7 +419,7 @@
       "farfieldpolar2d exists — 2D polar cross-section"
     ],
     "category": "analysis",
-    "verified_against": "pending"
+    "verified_against": "v202 - live engine probe 2026-11 (dead)"
   },
   "transmission": {
     "signature": "transmission(\"monitor_name\")  (exact signature PENDING verification)",
@@ -427,22 +428,24 @@
       "monitor_name": "name of a power monitor"
     },
     "common_pitfalls": [
+      "Verified live on v202 (2026-11): the command exists; without monitor data it reports \"no d-card ... with the necessary data\"",
       "Returns total transmission (T) through the monitor plane",
       "For polarization-resolved transmission use getresult + field component"
     ],
     "category": "analysis",
-    "verified_against": "pending"
+    "verified_against": "v202 - live engine probes 2026-11"
   },
   "dipolepower": {
     "signature": "dipolepower()  (exact signature PENDING verification)",
     "returns": "total power emitted by a dipole source",
     "valid_args": {},
     "common_pitfalls": [
+      "Verified live on v202 (2026-11): the command exists but returns an empty error string when the context is not suitable (this is documented in docs/verified/v202.md)",
       "Returns the total radiated power — useful for normalizing Purcell factor calculations",
       "Must be called in analysis mode with the dipole as an active source"
     ],
     "category": "analysis",
-    "verified_against": "pending"
+    "verified_against": "v202 - live engine probes 2026-11"
   },
   "haveresult": {
     "signature": "haveresult(\"name\")  (exact signature PENDING verification)",
@@ -451,11 +454,11 @@
       "name": "monitor or element name"
     },
     "common_pitfalls": [
-      "Use this BEFORE getresult to avoid errors when no results exist yet",
-      "Only available in analysis mode (after run)"
+      "Verified live on v202 (2026-11): returns 1.0/0.0; it is true for objects that CAN hold results, so confirm with getresult before treating it as \"data exists\"",
+      "Use this BEFORE getresult to avoid errors when no results exist yet"
     ],
     "category": "result",
-    "verified_against": "pending"
+    "verified_against": "v202 - live engine probes 2026-11"
   },
   "matlabsave": {
     "signature": "matlabsave(\"filepath.mat\", variable)",
@@ -476,11 +479,11 @@
     "returns": "none (switches FDTD solver to layout mode)",
     "valid_args": {},
     "common_pitfalls": [
-      "After running a simulation, you're in analysis mode — switchtolayout() returns to layout mode for editing",
-      "Saving and reopening a .fsp also returns to layout mode"
+      "Verified live on v202 (2026-11): returns to layout mode; layoutmode() reports 1/0",
+      "After running a simulation you are in analysis mode — switchtolayout() returns to layout mode for editing"
     ],
     "category": "general",
-    "verified_against": "pending"
+    "verified_against": "v202 - live engine probes 2026-11"
   },
   "addvarfdtd": {
     "signature": "NOT AVAILABLE in v202 — 'is not a valid function or variable name'.",
@@ -711,5 +714,27 @@
     ],
     "category": "general",
     "verified_against": "Lumerical docs; mirrored by the fake engine"
+  },
+  "farfieldpolar2d": {
+    "signature": "farfieldpolar2d(...)  [2D polar far-field projection]",
+    "returns": "2D polar far-field data",
+    "valid_args": {},
+    "common_pitfalls": [
+      "Verified live on v202 (2026-11): the command exists; without a suitable monitor/data it reports \"the simulation has the wrong dimension\" or \"monitor ... cannot be found\"",
+      "Use after a run, in analysis mode, with a monitor that has the necessary far-field data"
+    ],
+    "category": "analysis",
+    "verified_against": "v202 - live engine probes 2026-11"
+  },
+  "farfieldpolar3d": {
+    "signature": "farfieldpolar3d(...)  [3D polar far-field projection]",
+    "returns": "3D polar far-field data",
+    "valid_args": {},
+    "common_pitfalls": [
+      "Verified live on v202 (2026-11): the command exists; without monitor data it reports \"the requested monitor with the necessary data cannot be found\"",
+      "Use after a run, in analysis mode"
+    ],
+    "category": "analysis",
+    "verified_against": "v202 - live engine probes 2026-11"
   }
 }

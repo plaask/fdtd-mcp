@@ -234,6 +234,31 @@ def test_import_add_gds(bs):
     assert 'error' in r and 'gds' in r['error']['message']
 
 
+def test_model_get_include_all_properties(bs):
+    bs.fresh()
+    bs.send('model_add', {'type': 'rectangle', 'name': 'all_props_rect'})
+    r = bs.send('model_get', {'name': 'all_props_rect'})
+    assert 'override color opacity from material database' not in r['result']
+
+    r = bs.send('model_get', {'name': 'all_props_rect',
+                              'include_all_properties': True})
+    assert 'override color opacity from material database' in r['result']
+    assert r['result']['all_properties_count'] > 0
+
+
+def test_result_list_marks_orphan_results(bs):
+    bs.fresh()
+    bs.send('model_add', {'type': 'dft_monitor', 'name': 'm_orphan'})
+    bs.send('model_info', {})          # records the name in _seen_objects
+    bs.send('run', {})
+    bs.send('model_delete', {'name': 'm_orphan'})
+
+    r = bs.send('result_list', {'all': True})
+    orphans = [m for m in r['result']['monitors'] if m.get('orphan')]
+    assert any(m['monitor'] == 'm_orphan' for m in orphans)
+    assert r['result']['orphan_count'] == 1
+
+
 def test_model_info(bs):
     bs.fresh()
     bs.send('model_add', {'type': 'rectangle', 'name': 'r1'})
@@ -517,6 +542,7 @@ def test_sweep_crud(bs):
 
     r = bs.send('sweep_run', {'name': 'gap_sweep'})
     assert r['result']['status'] == 'completed'
+    assert 'diagnostics' in r['result']
 
     r = bs.send('sweep_get', {'name': 'gap_sweep'})
     assert r['result']['has_results'] is True
@@ -971,6 +997,18 @@ def test_execute_autosave_ignores_commented_run(bs):
     assert r['result']['status'] == 'ok'
     st = bs.send('engine_status', {})['result']
     assert st['autosave_path']
+
+
+def test_execute_autosave_covers_resume(bs):
+    """resume() must autosave first, or a hidden engine pops a Save dialog."""
+    bs.fresh()
+    r = bs.send('execute', {'code': '# resume later\naddrect();'})
+    assert r['result']['status'] == 'ok'
+    assert bs.send('engine_status', {})['result']['autosave_path'] is None
+
+    r = bs.send('execute', {'code': 'resume();'})
+    assert r['result']['status'] == 'ok'
+    assert bs.send('engine_status', {})['result']['autosave_path']
 
 
 def test_percent_lines_are_flagged_and_rejected(bs):

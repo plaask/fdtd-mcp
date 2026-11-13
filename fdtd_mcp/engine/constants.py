@@ -13,4 +13,5 @@ LSF_PROP_TYPES = {'number': 0, 'text': 1, 'length': 2, 'time': 3,
 
 # LSF commands that start a solve; executing any of these on an unsaved project
 # pops an invisible 'Save As' dialog that wedges the hidden engine.
-RUN_COMMAND = re.compile(r'(?<![A-Za-z_])(run|runsweep|runanalysis|runsweepanalysis|runmany)\b')
+RUN_COMMAND = re.compile(
+    r'(?<![A-Za-z_])(run|runsweep|runanalysis|runsweepanalysis|runmany|resume)\b')

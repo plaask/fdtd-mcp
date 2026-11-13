@@ -12,8 +12,8 @@ from pathlib import Path
 from fdtd_mcp.toolspec import SPECS, spec_by_name, visible_specs
 
 PKG = Path(__file__).resolve().parents[1] / 'fdtd_mcp'
-MODULES = {'session', 'model', 'material', 'sweep', 'result', 'engine',
-           'library'}
+MODULES = {'session', 'model', 'material', 'attribute', 'sweep', 'result',
+           'engine', 'library'}
 
 
 def _dispatch():

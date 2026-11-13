@@ -15,7 +15,7 @@ from ..engine.capabilities import (DEAD_COMMANDS, VERIFIED_AGAINST, code_id,
 from ..engine.constants import ERR_MSG as _ERR_MSG
 from ..engine.constants import RUN_COMMAND as _RUN_RE
 from ..engine.errors import BridgeError
-from ..engine.lsf import parse_query, strip_comments_and_strings
+from ..engine.lsf import lsf_quote, parse_query, strip_comments_and_strings
 
 # `set("setup script", ...)` in any spacing/quoting — script editing has its own
 # tool. Normalising whitespace first closes the `set ("analysis script", ...)`
@@ -23,6 +23,32 @@ from ..engine.lsf import parse_query, strip_comments_and_strings
 _SCRIPT_SET = re.compile(
     r'\bset\s*\(\s*[\'"]?\s*(setup\s+script|analysis\s+script|script)\s*[\'"]?\s*,')
 _WS = re.compile(r'\s+')
+
+
+def _rewrite_query_lines(code, path):
+    """Rewrite LSF `?expr` lines into `write(path, num2str(expr))`.
+
+    lumapi.eval() does not return the text printed by `?`, so multi-statement
+    scripts cannot capture query values otherwise. Returns (script, count).
+    Only lines whose first non-space character is `?` are rewritten; `?`
+    inside a string or comment is left alone.
+    """
+    out = []
+    count = 0
+    for line in code.split('\n'):
+        stripped = line.lstrip()
+        if stripped.startswith('?'):
+            expr = stripped[1:].split('#', 1)[0].strip()
+            if expr.endswith(';'):
+                expr = expr[:-1].rstrip()
+            if expr:
+                indent = line[:len(line) - len(stripped)]
+                out.append('%swrite(%s, num2str(%s));'
+                           % (indent, lsf_quote(path), expr))
+                count += 1
+                continue
+        out.append(line)
+    return '\n'.join(out), count
 
 
 class EngineHandlers(BridgeBase):
@@ -56,6 +82,9 @@ class EngineHandlers(BridgeBase):
                 'Do NOT use execute() to set scripts. '
                 'Use model_script(action="set", ...) instead.')
 
+        if p.get('capture'):
+            return self._execute_capture(code)
+
         if code.startswith('?'):
             return self._query(code[1:].strip())
 
@@ -67,8 +96,63 @@ class EngineHandlers(BridgeBase):
         try:
             self._fsp.eval(code)
         except Exception as e:
-            raise BridgeError(str(e)[:_ERR_MSG])
+            msg = str(e)[:_ERR_MSG]
+            if 'Failed to evaluate code' in msg:
+                msg += (' | LSF rejected the script (comments start with #, not '
+                        '%); use execute_file for line numbers, or execute('
+                        'capture=True) to capture ? values.')
+            raise BridgeError(msg)
         return {'status': 'ok'}
+
+    def _execute_capture(self, code):
+        """Run a script and capture its `?expr` lines via a temp file."""
+        tmp = os.path.join(self._tmp_dir, '_mcp_capture_%d.txt' % os.getpid())
+        try:
+            os.remove(tmp)
+        except OSError:
+            pass
+        script, count = _rewrite_query_lines(code, tmp)
+        if not count:
+            if _RUN_RE.search(strip_comments_and_strings(code)):
+                self._ensure_project_saved()
+            self._reset_to_model_root()
+            try:
+                self._fsp.eval(code)
+            except Exception as e:
+                raise BridgeError(str(e)[:_ERR_MSG])
+            return {'status': 'ok', 'captured': [],
+                    'note': 'no lines starting with "?"; nothing to capture'}
+
+        if _RUN_RE.search(strip_comments_and_strings(script)):
+            self._ensure_project_saved()
+        self._reset_to_model_root()
+        try:
+            self._fsp.eval(script)
+        except Exception as e:
+            raise BridgeError('capture failed: %s' % str(e)[:_ERR_MSG])
+        try:
+            text = None
+            for enc in ('utf-8', 'gbk', 'gb18030'):
+                try:
+                    with open(tmp, 'r', encoding=enc) as f:
+                        text = f.read()
+                    break
+                except (UnicodeDecodeError, LookupError):
+                    continue
+            if text is None:
+                with open(tmp, 'r', encoding='utf-8', errors='replace') as f:
+                    text = f.read()
+            lines = [ln for ln in text.splitlines() if ln.strip()]
+        except Exception as e:
+            raise BridgeError('captured file could not be read: %s'
+                              % str(e)[:_ERR_MSG])
+        finally:
+            try:
+                os.remove(tmp)
+            except OSError:
+                pass
+        return {'status': 'ok', 'query_count': count, 'captured': lines,
+                'stdout': '\n'.join(lines)}
 
     def _query(self, expr):
         """Resolve a `?expr` query into a returned value."""
@@ -150,6 +234,8 @@ class EngineHandlers(BridgeBase):
             'recent_calls': list(getattr(self, '_trace', []) or []),
         }
         if self._fsp:
+            status['layout_mode'] = self._layout_mode()
+            status['mode'] = self._mode_name()
             summary = {}
             for key in ('dimension', 'x span', 'y span', 'z span',
                         'simulation time', 'mesh accuracy'):

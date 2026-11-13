@@ -88,7 +88,7 @@ If auto-detection fails, add the `--lumerical-home` argument:
 The MCP server is bridged into DSH through its official plugin
 `@deepseek-ai/dsh-mcp-client` (ships with every `dsh` install). Tools are exposed
 to DSH as `mcp__fdtd__*` (e.g. `mcp__fdtd__execute`, `mcp__fdtd__run`,
-`mcp__fdtd__model_add`; 34 tools total).
+`mcp__fdtd__model_add`; 38 tools total).
 
 **Registration steps:**
 
@@ -102,11 +102,11 @@ to DSH as `mcp__fdtd__*` (e.g. `mcp__fdtd__execute`, `mcp__fdtd__run`,
       config:
         serverName: fdtd
         transport: stdio
-        command: D:/coding/anaconda3/python.exe   # ← your Python ≥3.10 (with the mcp package)
+        command: python   # ← your Python ≥3.10 (with the mcp package)
         args: ['-m', 'fdtd_mcp.server']
         env:
-          PYTHONPATH: D:/project/fdtd-mcp          # ← your checkout; can be removed after pip install .
-        cwd: D:/project/fdtd-mcp                   # ← same
+          PYTHONPATH: <repo>          # ← your checkout; can be removed after pip install .
+        cwd: <repo>                   # ← same
         failOnStartupError: false                  # skip tool registration, never block GUI boot
 ```
 
@@ -126,17 +126,19 @@ For other profiles (e.g. headless), add the same snippet to
 `$DSH_HOME/cordis.patch.yml` which applies to every profile. This integration does
 not affect the Claude Code `.mcp.json` registration.
 
-## Tools (34 tools, 7 modules)
+## Tools (38 tools, 8 modules)
 
 ```
 session (5)     session_open, session_new, session_close,
                 session_save, session_save_as
 
-model (6)       model_info, model_add, model_get, model_set,
-                model_delete, model_script
+model (8)       model_info, stack_report, import_add, model_add, model_get,
+                model_set, model_delete, model_script
 
-material (5)    material_add, material_get, material_set,
-                material_delete, material_exists
+material (6)    material_add, material_get, material_set, material_delete,
+                material_exists, material_index
+
+attribute (1)   attribute_add
 
 sweep (6)       sweep_add, sweep_get, sweep_set, sweep_delete,
                 sweep_run, sweep_result
@@ -148,6 +150,21 @@ engine (6)      run, execute, execute_file, reference_lookup, engine_status,
 
 library (2)     library_list, library_insert
 ```
+
+New in this pass (verified against v202):
+
+* `attribute_add` creates the five GUI Attributes grid attributes (LC orientation,
+  permittivity rotation, matrix transform, np density, temperature).
+* `model_add` adds `port`, `mode_expansion`, `container_group`, `custom`,
+  `planar_solid`, `stack`, `layer_builder`; a port needs an FDTD region first.
+* `material_index` samples xx/yy/zz; for `sampled 3d data`, 4 columns are
+  `[f, eps_xx, eps_yy, eps_zz]` (frequency in Hz plus complex permittivity —
+  not n/k).
+* `stack_report` sorts layers by z and flags overlaps, gaps, sub-nm layers,
+  layers outside the FDTD z range, and structures filling the transverse PML.
+* `import_add` supports GDSII first (`gdsimport`); STL/surface/image follow.
+* `sweep_set` checks the `setsweep` 0/1 return value; unknown properties such as
+  `solver` now return `status: error` instead of a silent success.
 
 `run` / `sweep_run` auto-save an unsaved project to a temp path before solving,
 so they never block on Lumerical's invisible "Save As" dialog when the engine is
@@ -190,8 +207,9 @@ only fails when the sweep runs, so `model_get` the target first.
 | Module | Purpose | Tools |
 |--------|---------|-------|
 | **session** | Project file lifecycle | `session_open`, `session_new`, `session_close`, `session_save`, `session_save_as` |
-| **model** | Object tree unified CRUD | `model_info`, `model_add`, `model_get`, `model_set`, `model_delete`, `model_script` |
-| **material** | Material database | `material_add`, `material_get`, `material_set`, `material_delete`, `material_exists` |
+| **model** | Object tree unified CRUD | `model_info`, `stack_report`, `import_add`, `model_add`, `model_get`, `model_set`, `model_delete`, `model_script` |
+| **material** | Material database | `material_add`, `material_get`, `material_set`, `material_delete`, `material_exists`, `material_index` |
+| **attribute** | Grid attributes (Attributes group) | `attribute_add` |
 | **sweep** | Parameter sweep lifecycle | `sweep_add`, `sweep_get`, `sweep_set`, `sweep_delete`, `sweep_run`, `sweep_result` |
 | **result** | Simulation data | `result_list`, `result_get`, `result_save`, `result_has` |
 | **engine** | Direct engine interaction | `run`, `execute`, `execute_file`, `reference_lookup`, `engine_status`, `engine_cleanup` |
@@ -290,17 +308,17 @@ session_save("new_sim.fsp")
 
 ```
 material_add(type="Sampled 3D data")                      → {name: "New material 1"}
-material_set("New material 1", "name", "PA_RCP")
-material_set("PA_RCP", "sampled 3d data",
-  [[300e-9, 1.52], [800e-9, 1.46]])                       # Nx2 [wl, n] or Nx4 [wl, n, k, 0]
-material_set("PA_RCP", "mesh order", 2)                   # v202 rejects 3 columns
+material_set(name="New material 1", property="name", value="PA_RCP")
+# 2 columns = [f(Hz), eps] (isotropic); 4 = [f, eps_xx, eps_yy, eps_zz]
+# eps = n^2; complex values may be written as [re, im]
+material_set(name="PA_RCP", property="sampled 3d data",
+             value=[[3e14, [4.0, 0.0]], [4e14, [4.1, 0.05]]])
+material_set(name="PA_RCP", property="mesh order", value=2)
 
 # Assign to an object
-model_set("substrate", {"material": "PA_RCP"})
+model_set(name="substrate", properties={"material": "PA_RCP"})
 
-# Or import from file
-execute('importnk("D:/data/nk_data.txt")')
-model_set("substrate", {"material": "nk_data"})
+# importnk() targets an import OBJECT, not a material; use the set above.
 ```
 
 ### Structure groups and analysis groups
@@ -401,7 +419,7 @@ fdtd-mcp/
 │   │   ├── library.py    #   object library catalog (Resources/fdtd-library)
 │   │   └── base.py       #   shared mix-in (_call_lsf, sanitising, name resolve)
 │   ├── handlers/         # one mix-in per module: session, model, material,
-│   │                     #   sweep, result, library, engine_tools
+│   │                     #   attribute, sweep, result, library, engine_tools
 │   ├── server.py         # MCP server (system Python)
 │   └── cheatsheet/
 │       └── lumapi_ref.json  # Lumerical API reference (verified_against per entry)

@@ -138,22 +138,85 @@ SPECS = [
         read_only=True,
     ),
     ToolSpec(
+        name='stack_report',
+        module='model',
+        description=(
+'One-call layer-stack audit (read-only). Sorts objects by z, reports z min/max,\n'
+        'thickness, material and mesh order, and flags:\n'
+        '  * overlapping layers and gaps\n'
+        '  * layers thinner than 1 nm\n'
+        '  * layers extending outside the FDTD z range\n'
+        '  * structures whose x/y spans fill the FDTD region while x/y use PML\n'
+        '    (a common cause of divergence: dispersive material inside the PML)\n'
+        '\n'
+        'Example:\n'
+        '  stack_report()\n'
+        '  stack_report(include_disabled=true)'
+        ),
+        schema={'type':'object','properties':{
+        'include_disabled':{'type':'boolean',
+            'description':'Include disabled objects (default false)'}}},
+        defaults={'include_disabled': False},
+        read_only=True,
+    ),
+    ToolSpec(
+        name='import_add',
+        module='model',
+        description=(
+'Import structures from a GDSII file (v202 gdsimport).\n'
+        '\n'
+        'Signature used: gdsimport(path, cell, layer [, material [, zmin, zmax]]).\n'
+        'Without zmin/zmax the 2D data is extruded to the default Z in a 3D\n'
+        'layout; with both, the structures are extruded to that exact z range\n'
+        '(material is required for that form).\n'
+        '\n'
+        'Returns the number of imported objects and their root-level names.\n'
+        'Run this in layout mode; an analysis-mode project must switch back first.\n'
+        '\n'
+        'Example:\n'
+        '  import_add(kind="gds", path="D:/data/chip.gds", cell="TOP", layer=1,\n'
+        '             material="Si (Silicon) - Palik", zmin=-220e-9, zmax=0)'
+        ),
+        schema={'type':'object','properties':{
+        'kind':{'type':'string','enum':['gds'],
+            'description':'Import kind (only gds is supported so far)'},
+        'path':{'type':'string','description':'Path to the .gds file'},
+        'cell':{'type':'string','description':'GDS cell name'},
+        'layer':{'type':'integer','description':'GDS layer number'},
+        'material':{'type':'string','description':'Optional material name'},
+        'zmin':{'type':'number','description':'Optional extrusion z min (m)'},
+        'zmax':{'type':'number','description':'Optional extrusion z max (m)'}},
+        'required':['path','cell','layer']},
+        defaults={'kind': 'gds'},
+        destructive=True,
+    ),
+    ToolSpec(
         name='model_add',
         module='model',
         description=(
 'Add ANY object to the model tree.\n'
         '\n'
-        'Supported types:\n'
-        '  rectangle, circle, ring, polygon, sphere, pyramid, triangle, waveguide\n'
-        '  fdtd, mesh\n'
+        'Supported types (v202-verified):\n'
+        '  rectangle, circle, ring, polygon, sphere, pyramid, triangle, waveguide,\n'
+        '  custom, planar_solid\n'
+        '  fdtd, mesh, stack\n'
         '  dipole, tfsf, plane, gaussian, mode_source\n'
-        '  power_monitor, dft_monitor, index_monitor, field_monitor, movie_monitor\n'
-        '  structure_group, analysis_group\n'
+        '  power_monitor, dft_monitor, index_monitor, field_monitor, movie_monitor,\n'
+        '  mode_expansion\n'
+        '  structure_group, analysis_group, container_group, layer_builder\n'
+        '  port\n'
+        '\n'
+        'Prerequisites:\n'
+        '  port             requires an FDTD solver region (add type="fdtd" first);\n'
+        '                   it is placed under FDTD::ports\n'
+        '  stack            is the STACK solver object and needs a STACK license\n'
+        '  layer_builder    creates a layer-builder structure group\n'
         '\n'
         'Examples:\n'
         '  model_add(type="rectangle", name="my_rect",\n'
         '    properties={"x span": 1e-6, "y span": 2e-6})\n'
         '  model_add(type="dipole", properties={"x": 0, "y": 0, "z": 0})\n'
+        '  model_add(type="port", name="port_in")\n'
         '\n'
         'If name is omitted, Lumerical auto-generates one.\n'
         'Use scope="::model" (default) to add at root level.'
@@ -161,11 +224,15 @@ SPECS = [
         schema={'type':'object','properties':{
         'type':{'type':'string','description':'Object type to create',
             'enum':['rectangle','circle','ring','polygon','sphere','pyramid','triangle',
-                    'waveguide','fdtd','mesh','dipole','tfsf','plane','gaussian',
-                    'mode_source','power_monitor','dft_monitor','index_monitor',
-                    'field_monitor','movie_monitor','structure_group','analysis_group']},
+                    'waveguide','custom','planar_solid','fdtd','mesh','stack',
+                    'dipole','tfsf','plane','gaussian','mode_source',
+                    'power_monitor','dft_monitor','index_monitor','field_monitor',
+                    'movie_monitor','mode_expansion','structure_group',
+                    'analysis_group','container_group','layer_builder','port']},
         'name':{'type':'string','description':'Optional name (auto-generated if omitted)'},
         'properties':{'type':'object','description':'Optional property dict to set after creation'},
+        'property_types':{'type':'object',
+            'description':'Optional {property: type code or name} for properties newly declared on a group'},
         'scope':{'type':'string','description':'Parent scope, default "::model"'}},
         'required':['type']},
     ),
@@ -227,7 +294,11 @@ SPECS = [
         'properties':{'type':'object','description':'Dict of property=value pairs'},
         'property_types':{'type':'object','description':'Optional {property: type code or name} for newly declared properties'},
         'results':{'type':'array','items':{'type':'string'},
-            'description':'Analysis result names to declare (the dialog\'s Results table)'}},
+            'description':'Analysis result names to declare (the dialog\'s Results table)'},
+        'property':{'type':'string','description':'Deprecated single-property form: property name'},
+        'value':{'description':'Deprecated single-property form: new value'},
+        'object':{'type':'string','description':'Deprecated single-property form: target object (default ::model)'},
+        'property_type':{'description':'Deprecated single-property form: type code or name'}},
         'required':['name']},
     ),
     ToolSpec(
@@ -272,6 +343,7 @@ SPECS = [
         'name':{'type':'string','description':'Object name, default "::model"'},
         'action':{'type':'string','description':'"get" (default) or "set"'},
         'script_type':{'type':'string','description':'"setup", "analysis", or "script" (auto-detected if omitted)'},
+        'type':{'type':'string','description':'Deprecated alias for script_type'},
         'content':{'type':'string','description':'Script text (required for action="set")'}},
         'required':['name']},
         defaults={'action': 'get', 'script_type': ''},
@@ -328,21 +400,23 @@ SPECS = [
         '  "name"            -> rename the material\n'
         '  "color"           -> RGBA color\n'
         '\n'
-        'Data format for sampled materials:\n'
-        '  Nx2: [[wl1, n1], [wl2, n2], ...]          (real index only)\n'
-        '  Nx4: [[wl1, n1, k1, 0], ...]              (with extinction)\n'
-        '  or [[freq1, eps1], [freq2, eps2], ...]\n'
-        'Errors are returned verbatim, e.g. "the number of columns ... should be\n'
-        'either 2 or 4".\n'
+        'Data format for "sampled 3d data" (verified against Lumerical docs):\n'
+        '  column 1: frequency in Hz (NOT wavelength)\n'
+        '  remaining columns: COMPLEX permittivity (eps = n^2)\n'
+        '  Nx2: [[f1, eps1], ...]                       isotropic\n'
+        '  Nx4: [[f1, eps_xx, eps_yy, eps_zz], ...]     diagonal anisotropic\n'
+        '  A complex value may be written as [re, im] or "re+imi".\n'
+        '  3 columns are rejected by the engine (only 2 or 4 are valid).\n'
+        '  `value` may also be the {"data": ...} dict returned by material_get.\n'
         '\n'
         'Examples:\n'
         '  material_set(name="mat1", property="Refractive Index", value=1.5)\n'
         '  material_set(name="mat1", property="mesh order", value=2)\n'
         '  material_set(name="mat1", property="sampled 3d data",\n'
-        '    value=[[300e-9,1.52],[800e-9,1.46]])\n'
+        '    value=[[3e14, [4.0, 0.0]], [4e14, [4.1, 0.05]]])\n'
         '\n'
-        'For large nk datasets, prefer file import:\n'
-        '  execute(\'importnk("C:/path/to/nk_data.txt")\')\n'
+        'For large datasets pass the rows directly; importnk() targets an import\n'
+        'object, not a material.\n'
         'Tip: Call material_get(name) WITHOUT property first to see all settable property names.'
         ),
         schema={'type':'object','properties':{
@@ -376,12 +450,78 @@ SPECS = [
         read_only=True,
     ),
     ToolSpec(
+        name='material_index',
+        module='material',
+        description=(
+'Sample a material\'s complex refractive index and permittivity.\n'
+        'For "sampled 3d data": 4-column data is diagonal anisotropic\n'
+        '[f, eps_xx, eps_yy, eps_zz], 2-column data is isotropic [f, eps].\n'
+        'getindex() only reports the xx component, so use this tool for yy/zz.\n'
+        '\n'
+        'Pass wavelengths= (metres, c/lambda) OR frequencies= (Hz), not both.\n'
+        'With neither, the tabulated points are returned. Points outside the\n'
+        'tabulated range are returned as null.\n'
+        '\n'
+        'Example:\n'
+        '  material_index(name="MoOCl2", wavelengths=[600e-9, 800e-9],\n'
+        '                 component="zz")'
+        ),
+        schema={'type':'object','properties':{
+        'name':{'type':'string'},
+        'wavelengths':{'type':'array','items':{'type':'number'},
+            'description':'Wavelengths in metres (e.g. 600e-9)'},
+        'frequencies':{'type':'array','items':{'type':'number'},
+            'description':'Frequencies in Hz'},
+        'component':{'type':'string','enum':['xx','yy','zz'],
+            'description':'Diagonal permittivity component (default xx)'}},
+        'required':['name']},
+        defaults={'component': 'xx'},
+        read_only=True,
+    ),
+    ToolSpec(
+        name='attribute_add',
+        module='attribute',
+        description=(
+'Add a GRID ATTRIBUTE (the GUI "Attributes" group).\n'
+        'These are root-level objects that carry spatially varying data\n'
+        '(LC orientation, permittivity rotation, matrix transform, np density,\n'
+        'temperature) — they are separate from object properties.\n'
+        '\n'
+        'Verified live on v202: all five kinds exist and are created with\n'
+        'addgridattribute("<kind>"). The object keeps an auto name such as\n'
+        '"LC attribute"; pass name= to rename it.\n'
+        '\n'
+        'Kinds:\n'
+        '  "lc orientation", "permittivity rotation", "matrix transform",\n'
+        '  "np density", "temperature"\n'
+        '\n'
+        'Examples:\n'
+        '  attribute_add(kind="lc orientation")\n'
+        '  attribute_add(kind="temperature", name="temp_map")\n'
+        '\n'
+        'np density / temperature attributes are populated by importing an\n'
+        'unstructured dataset; that import is not part of this tool yet.'
+        ),
+        schema={'type':'object','properties':{
+        'kind':{'type':'string',
+            'enum':['lc orientation','permittivity rotation','matrix transform',
+                    'np density','temperature']},
+        'name':{'type':'string','description':'Optional new name for the object'}},
+        'required':['kind']},
+        destructive=True,
+    ),
+    ToolSpec(
         name='sweep_add',
         module='sweep',
         description=(
 'Create and configure a parameter sweep.\n'
         '\n'
-        'types: 0=parameter sweep, 1=optimization, 2=monte carlo, 3=s-parameter\n'
+        'type is the sweep KIND, not a solver:\n'
+        '  0=parameter sweep, 1=optimization, 2=Monte Carlo, 3=S-parameter\n'
+        '\n'
+        'FDTD has no solver parameter. The solver is always FDTD; do NOT pass\n'
+        'solver=... to this tool (unknown parameters are rejected). On v202\n'
+        'setsweep does not expose a "solver" property either.\n'
         '\n'
         'Parameter dicts use keys: name, parameter (the object property path to\n'
         'sweep, e.g. "::model::substrate::z span" — use "::" separators, NOT ">":\n'
@@ -389,7 +529,7 @@ SPECS = [
         'and points (number of sample points; applied at the sweep level).\n'
         'Sampling is Linear by default — do NOT set a per-parameter "type" sampling\n'
         'string; "type" is the parameter VALUE data type and should be omitted\n'
-        '(or "Number").\n'
+        '(or "Number"). Unknown keys in a parameter dict are rejected.\n'
         '\n'
         'Model variables work as sweep targets: create them first with\n'
         'model_set(name="::model", properties={"gap": 200e-9}) and sweep\n'
@@ -398,6 +538,10 @@ SPECS = [
         'exist, so a typo only shows up when the sweep runs — model_get the\n'
         'target first if you are not sure it exists.\n'
         '\n'
+        'For type=3 (S-parameter), add ports first with model_add(type="port");\n'
+        'otherwise the sweep is created but cannot run (the reply carries a\n'
+        'warning).\n'
+        '\n'
         'Example:\n'
         '  sweep_add(name="thickness_sweep", type=0,\n'
         '    parameters=[{"name":"t","parameter":"::model::substrate::z span",\n'
@@ -405,10 +549,23 @@ SPECS = [
         '    results=[{"name":"T","result":"::model::transmission_calc::T"}])'
         ),
         schema={'type':'object','properties':{
-        'type':{'type':'integer','description':'Sweep type: 0=parameter, 1=optimization, 2=monte carlo, 3=s-parameter (default 0)'},
+        'type':{'type':'integer','enum':[0,1,2,3],
+            'description':'Sweep kind: 0=parameter, 1=optimization, 2=Monte Carlo, 3=S-parameter (default 0)'},
         'name':{'type':'string','description':'Sweep name'},
-        'parameters':{'type':'array','items':{'type':'object'},'description':'List of parameter dicts: {name, parameter, start, stop, points}'},
-        'results':{'type':'array','items':{'type':'object'},'description':'List of result dicts: {name, result}'}},
+        'parameters':{'type':'array','items':{'type':'object',
+            'properties':{
+                'name':{'type':'string'},
+                'parameter':{'type':'string'},
+                'start':{'type':'number'},
+                'stop':{'type':'number'},
+                'points':{'type':'integer'},
+                'type':{'description':'Parameter value type: "Number" or an integer code'}},
+            'additionalProperties':False},
+            'description':'List of parameter dicts: {name, parameter, start, stop, points}'},
+        'results':{'type':'array','items':{'type':'object',
+            'properties':{'name':{'type':'string'},'result':{'type':'string'}},
+            'additionalProperties':False},
+            'description':'List of result dicts: {name, result}'}},
         'required':['name']},
         defaults={'type': 0},
     ),
@@ -417,10 +574,17 @@ SPECS = [
         module='sweep',
         description=(
 'Get parameter sweep configuration.\n'
-        'Tells you: whether the sweep exists, has results, and result structure.\n'
+        'Returns whether the sweep exists, whether it has results, its editable\n'
+        'property names (from getsweep/setsweep), the inferred sweep kind, and\n'
+        'the parameter names. Use this instead of guessing sweep properties.\n'
+        '\n'
+        'On v202 a parameter sweep exposes exactly:\n'
+        '  name, type, number of points, resave files after analysis\n'
+        'There is NO solver property. "type" is Ranges or Values.\n'
         '\n'
         'Example:\n'
-        '  sweep_get(name="gap_sweep") -> {exists: true, has_results: false, note: "not yet run"}'
+        '  sweep_get(name="gap_sweep") -> {exists: true, has_results: false,\n'
+        '                                 properties: [...], sweep_type: 0}'
         ),
         schema={'type':'object','properties':{
         'name':{'type':'string','description':'Sweep name'}},
@@ -433,8 +597,19 @@ SPECS = [
         description=(
 'Modify sweep properties.\n'
         '\n'
-        'Example:\n'
-        '  sweep_set(name="gap_sweep", properties={"sweep type": 0})'
+        'The editable property names depend on the sweep kind; call sweep_get\n'
+        'first. On v202 a parameter sweep exposes exactly:\n'
+        '  name, type, number of points, resave files after analysis\n'
+        'There is NO solver property. "type" takes "Ranges" or "Values"\n'
+        '(NOT 0/1, and NOT "sweep type").\n'
+        '\n'
+        'Unknown property names are rejected and reported in failures (v202\n'
+        'setsweep returns 0.0 for them instead of raising, so the tool checks\n'
+        'the return value and refuses to report a silent success).\n'
+        '\n'
+        'Examples:\n'
+        '  sweep_set(name="gap_sweep", properties={"type": "Ranges"})\n'
+        '  sweep_set(name="gap_sweep", properties={"number of points": 21})'
         ),
         schema={'type':'object','properties':{
         'name':{'type':'string','description':'Sweep name'},
@@ -503,6 +678,7 @@ SPECS = [
         ),
         schema={'type':'object','properties':{
         'monitor':{'type':'string','description':'Monitor/object name (default "FDTD")'},
+        'name':{'type':'string','description':'Deprecated alias for monitor'},
         'data':{'type':'string','description':'Dataset name, e.g. "E", "T" (optional)'},
         'all':{'type':'boolean','description':'With no monitor: list every object that has results'}}},
         defaults={'data': ''},
@@ -592,6 +768,12 @@ SPECS = [
         '  Create object:  execute("addrect(); setnamed(\\"rect\\", \\"x span\\", 1e-6)")\n'
         '  Multi-line:     execute("for i=1:10; ?i; end")\n'
         '\n'
+        'capture=true rewrites each line whose first non-space character is ?\n'
+        'into write(<temp>, num2str(<expr>)) and returns the captured lines in\n'
+        '"stdout". Use it for multi-statement scripts, e.g.\n'
+        '  execute("a = 3;\\n?num2str(a);", capture=true)\n'
+        'A ? that is not at the start of its own line is not captured.\n'
+        '\n'
         'DO NOT use execute for:\n'
         '  - Editing scripts       -> use model_script tool instead\n'
         '  - Setting material props -> use material_set tool instead\n'
@@ -602,15 +784,22 @@ SPECS = [
         ),
         schema={'type':'object','properties':{
         'code':{'type':'string','description':'LSF script code (multi-line supported)'},
+        'capture':{'type':'boolean',
+            'description':'Capture lines starting with ? via a temp file (default false)'},
         'timeout':{'type':'number','description':'Optional wait bound in seconds (0 = no timeout)'}},
         'required':['code']},
+        defaults={'capture': False},
         destructive=True, long_running=True,
     ),
     ToolSpec(
         name='execute_file',
         module='engine',
         description=(
-'Run a Lumerical script file (.lsf).'
+'Run a Lumerical script file (.lsf).\n'
+        '\n'
+        'The engine does not return the script\'s stdout to lumapi. To capture\n'
+        'values, write them to a file from the script (write("out.txt", ...))\n'
+        'or use execute(capture=true) for ?query lines.'
         ),
         schema={'type':'object','properties':{
         'path':{'type':'string'},

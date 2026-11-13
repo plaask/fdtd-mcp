@@ -22,6 +22,21 @@ from ..engine.lsf import lsf_quote
 class ResultHandlers(BridgeBase):
     """Monitor result discovery and extraction."""
 
+    @staticmethod
+    def _result_name_candidates(monitor):
+        """Try the given name, then its short name for a scoped path.
+
+        v202 accepts "::model::FDTD" for some result calls but not others; a
+        short-name fallback keeps the two consistent instead of making the
+        caller guess which spelling a particular API wants.
+        """
+        names = [monitor]
+        if '::' in monitor:
+            short = monitor.rsplit('::', 1)[-1]
+            if short and short not in names:
+                names.append(short)
+        return names
+
     _COMMON_RESULT_FIELDS = [
         'f', 'lambda', 'x', 'y', 'z',
         'Ex', 'Ey', 'Ez', 'Hx', 'Hy', 'Hz',
@@ -57,12 +72,21 @@ class ResultHandlers(BridgeBase):
 
         name = name or 'FDTD'
 
-        # Get result datasets
-        try:
-            r = self._call_lsf('getresult', name)
-            datasets = str(r).split('\n') if r else []
-        except Exception as e:
-            return {'name': name, 'datasets': [], 'error': str(e)[:_ERR_MSG]}
+        # Get result datasets (scoped name first, short-name fallback)
+        requested = name
+        r = None
+        last_err = None
+        for candidate in self._result_name_candidates(name):
+            try:
+                r = self._call_lsf('getresult', candidate)
+                name = candidate
+                break
+            except Exception as e:
+                last_err = e
+        if r is None:
+            return {'name': requested, 'datasets': [],
+                    'error': str(last_err)[:_ERR_MSG]}
+        datasets = str(r).split('\n') if r else []
 
         # Probe fields for each dataset
         datasets_with_fields = []
@@ -88,7 +112,8 @@ class ResultHandlers(BridgeBase):
                 datasets_with_fields.append({'data': dataset,
                                              'error': str(e)[:_ERR_MSG]})
 
-        return {'monitor': name, 'datasets': datasets_with_fields,
+        return {'monitor': name, 'monitor_requested': requested,
+                'datasets': datasets_with_fields,
                 'dataset_count': len(datasets_with_fields)}
 
     def _monitors_with_results(self):
@@ -144,17 +169,25 @@ class ResultHandlers(BridgeBase):
         # name like the old 'brd' clobbered user variables and leaked on error).
         values = {}
         truncated = {}
+        actual_monitor = None
+        last_err = None
         with self._temp_var('brd') as var:
-            try:
-                if data:
-                    self._fsp.eval('%s = getresult(%s,%s);'
-                                   % (var, lsf_quote(monitor), lsf_quote(data)))
-                else:
-                    self._fsp.eval('%s = getresult(%s);'
-                                   % (var, lsf_quote(monitor)))
-            except Exception as e:
+            for candidate in self._result_name_candidates(monitor):
+                try:
+                    if data:
+                        self._fsp.eval('%s = getresult(%s,%s);'
+                                       % (var, lsf_quote(candidate),
+                                          lsf_quote(data)))
+                    else:
+                        self._fsp.eval('%s = getresult(%s);'
+                                       % (var, lsf_quote(candidate)))
+                    actual_monitor = candidate
+                    break
+                except Exception as e:
+                    last_err = e
+            if actual_monitor is None:
                 raise BridgeError('could not load results from %s: %s'
-                                  % (monitor, str(e)[:_ERR_MSG]))
+                                  % (monitor, str(last_err)[:_ERR_MSG]))
 
             for field in fields:
                 try:
@@ -165,7 +198,8 @@ class ResultHandlers(BridgeBase):
                 except Exception as e:
                     values[field] = {'error': str(e)[:_ERR_MSG]}
 
-        result = {'monitor': monitor, 'data': data, 'values': values,
+        result = {'monitor': actual_monitor, 'monitor_requested': monitor,
+                  'data': data, 'values': values,
                   'fields_requested': fields, 'truncated': truncated}
         missing = [f for f in fields
                    if isinstance(values.get(f), dict) and 'error' in values[f]]
@@ -185,18 +219,30 @@ class ResultHandlers(BridgeBase):
             safe_data = re.sub(r'[^\w.-]+', '_', data or 'result').strip('_') or 'result'
             out = os.path.join(self._tmp_dir,
                                'result_%s_%s.mat' % (safe_mon, safe_data))
+        actual_monitor = None
+        last_err = None
         with self._temp_var('brd') as var:
+            for candidate in self._result_name_candidates(monitor):
+                try:
+                    if data:
+                        self._fsp.eval('%s = getresult(%s,%s);'
+                                       % (var, lsf_quote(candidate),
+                                          lsf_quote(data)))
+                    else:
+                        self._fsp.eval('%s = getresult(%s);'
+                                       % (var, lsf_quote(candidate)))
+                    actual_monitor = candidate
+                    break
+                except Exception as e:
+                    last_err = e
+            if actual_monitor is None:
+                raise BridgeError('result_save failed: %s'
+                                  % str(last_err)[:_ERR_MSG])
             try:
-                if data:
-                    self._fsp.eval('%s = getresult(%s,%s);'
-                                   % (var, lsf_quote(monitor), lsf_quote(data)))
-                else:
-                    self._fsp.eval('%s = getresult(%s);'
-                                   % (var, lsf_quote(monitor)))
                 self._fsp.eval('matlabsave(%s, %s);' % (lsf_quote(out), var))
             except Exception as e:
                 raise BridgeError('result_save failed: %s' % str(e)[:_ERR_MSG])
-        return {'file': out, 'status': 'ok'}
+        return {'file': out, 'status': 'ok', 'monitor': actual_monitor}
 
     def _cmd_result_has(self, p):
         """Check whether a monitor/element has results without throwing.
@@ -209,19 +255,27 @@ class ResultHandlers(BridgeBase):
         """
         self._require_project()
         name = p.get('monitor') or p.get('name')
-        try:
-            r = self._call_lsf('haveresult', name)
-            if r is not None:
-                return {'name': name, 'exists': bool(r),
-                        'check_method': 'haveresult',
-                        'note': 'exists=true means the object can hold results; '
-                                'confirm with result_get/result_list after a run.'}
-        except Exception:
-            pass
+        for candidate in self._result_name_candidates(name):
+            try:
+                r = self._call_lsf('haveresult', candidate)
+                if r is not None:
+                    return {'name': candidate,
+                            'requested': name,
+                            'exists': bool(r),
+                            'check_method': 'haveresult',
+                            'note': 'exists=true means the object can hold '
+                                    'results; confirm with result_get/result_list '
+                                    'after a run.'}
+            except Exception:
+                pass
         # Fallback: try getresult and see if it succeeds
-        try:
-            r = self._call_lsf('getresult', name)
-            return {'name': name, 'exists': r is not None and str(r).strip() != '',
-                    'check_method': 'getresult_attempt'}
-        except Exception:
-            return {'name': name, 'exists': False, 'check_method': 'exception_caught'}
+        for candidate in self._result_name_candidates(name):
+            try:
+                r = self._call_lsf('getresult', candidate)
+                return {'name': candidate, 'requested': name,
+                        'exists': r is not None and str(r).strip() != '',
+                        'check_method': 'getresult_attempt'}
+            except Exception:
+                pass
+        return {'name': name, 'exists': False,
+                'check_method': 'exception_caught'}

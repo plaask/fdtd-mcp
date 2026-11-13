@@ -6,6 +6,8 @@ syntax 3.6-compatible (no f-strings, no type hints).
 """
 from __future__ import print_function
 import os
+import re
+import time
 
 from ..engine import proctree
 from ..engine.base import BridgeBase
@@ -19,6 +21,145 @@ _FDTD_CONFIG_KEYS = ['dimension', 'x span', 'y span', 'z span',
 _SUMMARY_KEYS = ['dimension', 'x span', 'y span', 'z span', 'simulation time',
                  'mesh accuracy', 'x min bc', 'x max bc', 'y min bc', 'y max bc',
                  'z min bc', 'z max bc']
+
+# ---------------------------------------------------------------------------
+# Run-log diagnostics
+#
+# The engine writes <project>_p0.log next to the .fsp; when the fields diverge
+# it records "ERROR: Early termination ... fields are diverging" and an
+# Auto Shutoff value that jumps by orders of magnitude. run() used to return
+# only {status, saved_to}, so callers had to discover this by reading the log
+# themselves. These helpers keep the log path, the failure lines and the last
+# autoshutoff in the tool result.
+# ---------------------------------------------------------------------------
+_LOG_TAIL_BYTES = 256 * 1024
+_USER_PATH_RE = re.compile(r'([A-Za-z]:[\\/]Users[\\/])[^\\/\s]+',
+                           re.IGNORECASE)
+_AUTOSHUTOFF_FROM_TO_RE = re.compile(
+    r'(?i)from\s+([0-9eE+\-.]+)\s+to\s+([0-9eE+\-.]+)')
+_AUTOSHUTOFF_RE = re.compile(
+    r'(?i)auto\s*shutoff(?:\s*level)?\s*[:=]?\s*([0-9eE+\-.]+)')
+_STEP_RE = re.compile(r'\b(\d+)\s*/\s*(\d+)\s*(?:time\s*)?steps\b', re.I)
+
+
+def _redact_log_line(line):
+    """Remove the Windows user name from a log line before returning it."""
+    line = _USER_PATH_RE.sub(r'\1<user>', line)
+    return line[:500]
+
+
+def _autoshutoff_from_line(line):
+    m = _AUTOSHUTOFF_FROM_TO_RE.search(line)
+    if m:
+        try:
+            return float(m.group(2))
+        except ValueError:
+            return None
+    m = _AUTOSHUTOFF_RE.search(line)
+    if m:
+        try:
+            return float(m.group(1))
+        except ValueError:
+            return None
+    return None
+
+
+def _parse_engine_log(path):
+    """Parse the tail of a Lumerical engine log into a small diagnostics dict."""
+    size = os.path.getsize(path)
+    with open(path, 'rb') as f:
+        if size > _LOG_TAIL_BYTES:
+            f.seek(-_LOG_TAIL_BYTES, os.SEEK_END)
+        raw = f.read()
+
+    text = None
+    for enc in ('utf-8', 'gbk', 'gb18030', 'latin-1'):
+        try:
+            text = raw.decode(enc)
+            break
+        except (UnicodeDecodeError, LookupError):
+            continue
+    if text is None:
+        text = raw.decode('utf-8', 'replace')
+    if raw and size > _LOG_TAIL_BYTES:
+        # The tail may start mid-line; drop the first partial line.
+        text = text.split('\n', 1)[-1]
+
+    lines = [ln.rstrip() for ln in text.splitlines() if ln.strip()]
+    errors = []
+    warnings = []
+    autoshutoff = None
+    step = None
+    total_steps = None
+    for line in lines:
+        low = line.lower()
+        if re.search(r'(?i)\b(error|fatal)\b', line):
+            errors.append(_redact_log_line(line))
+        if re.search(r'(?i)\bwarning\b', line):
+            warnings.append(_redact_log_line(line))
+        value = _autoshutoff_from_line(line)
+        if value is not None:
+            autoshutoff = value
+        m = _STEP_RE.search(line)
+        if m:
+            try:
+                step = int(m.group(1))
+                total_steps = int(m.group(2))
+            except ValueError:
+                pass
+
+    lowered = text.lower()
+    early_termination = 'early termination' in lowered
+    diverged = ('diverg' in lowered) or (
+        early_termination and 'fields' in lowered)
+
+    return {
+        'log_found': True,
+        'log_path': path,
+        'diverged': bool(diverged),
+        'early_termination': bool(early_termination),
+        'autoshutoff': autoshutoff,
+        'step': step,
+        'total_steps': total_steps,
+        'errors': errors[-10:],
+        'warnings': warnings[-10:],
+        'log_tail': [_redact_log_line(ln) for ln in lines[-20:]],
+    }
+
+
+def _find_engine_log(saved, started=None):
+    """Locate <project>_p0.log next to the project (or the newest one there)."""
+    if not saved:
+        return None
+    directory = os.path.dirname(os.path.abspath(saved))
+    stem = os.path.splitext(os.path.basename(saved))[0]
+    candidates = []
+    for base in (directory, os.getcwd()):
+        candidates.extend([
+            os.path.join(base, stem + '_p0.log'),
+            os.path.join(base, stem + '.log'),
+        ])
+    for path in candidates:
+        try:
+            if os.path.isfile(path) and (
+                    started is None or os.path.getmtime(path) >= started - 5):
+                return path
+        except OSError:
+            pass
+
+    # Fallback: any fresh *_p0.log in the project directory (the engine may
+    # name it after a previous alias of the project).
+    try:
+        files = [os.path.join(directory, name)
+                 for name in os.listdir(directory)
+                 if name.endswith('_p0.log')]
+    except OSError:
+        return None
+    files = [p for p in files if os.path.isfile(p) and (
+        started is None or os.path.getmtime(p) >= started - 5)]
+    if not files:
+        return None
+    return max(files, key=os.path.getmtime)
 
 
 class SessionHandlers(BridgeBase):
@@ -126,6 +267,7 @@ class SessionHandlers(BridgeBase):
             except Exception:
                 summary[key] = None
         return {'status': 'ok', 'path': path, 'summary': summary,
+                'mode': self._mode_name(),
                 'session_generation': self._session_generation,
                 'engine': engine_facts()}
 
@@ -176,6 +318,7 @@ class SessionHandlers(BridgeBase):
             except Exception as e:
                 failed[key] = str(e)[:_ERR_MSG]
         result = {'status': 'ok' if not failed else 'partial', 'config': cfg,
+                  'mode': self._mode_name(),
                   'session_generation': self._session_generation,
                   'engine': engine_facts()}
         if failed:
@@ -200,17 +343,37 @@ class SessionHandlers(BridgeBase):
             self._fsp.save(self._autosave_path)
         return self._autosave_path
 
-    def _run_result(self, saved):
+    def _run_diagnostics(self, saved, started):
+        """Read the engine log written by this run; never fail run() over it."""
+        try:
+            log = _find_engine_log(saved, started)
+            if not log:
+                return {
+                    'log_found': False,
+                    'note': ('No <project>_p0.log was found next to the project '
+                             'after run; divergence diagnostics are unavailable.'),
+                }
+            return _parse_engine_log(log)
+        except Exception as e:
+            return {'log_found': False,
+                    'error': 'could not read engine log: %s'
+                             % str(e)[:_ERR_MSG]}
+
+    def _run_result(self, saved, started=None):
         result = {'status': 'completed', 'saved_to': saved,
+                  'mode': self._mode_name(),
                   'session_generation': self._session_generation}
         if not self._path:
             result['note'] = ('Project was unsaved, so it was written to a '
                               'temporary path before solving. Use session_save '
                               'to keep it.')
+        if started is not None:
+            result['diagnostics'] = self._run_diagnostics(saved, started)
         return result
 
     def _cmd_run(self, p):
         self._require_project()
         saved = self._ensure_project_saved()
+        started = time.time()
         self._fsp.run()
-        return self._run_result(saved)
+        return self._run_result(saved, started)

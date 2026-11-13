@@ -445,8 +445,16 @@ def _handle_engine_cleanup(arguments):
 
 
 # ---- Tools, annotations and validation derived from toolspec.SPECS ----
+def _mcp_schema(schema):
+    """The MCP-facing schema: same as the spec, but closed to extra keys."""
+    out = dict(schema)
+    out['additionalProperties'] = False
+    return out
+
+
 _VISIBLE = visible_specs()
-TOOLS = [types.Tool(name=s.name, description=s.description, inputSchema=s.schema)
+TOOLS = [types.Tool(name=s.name, description=s.description,
+                    inputSchema=_mcp_schema(s.schema))
          for s in _VISIBLE]
 for _spec, _tool in zip(_VISIBLE, TOOLS):
     if _spec.read_only:
@@ -471,6 +479,50 @@ for _name, _method in _DISPATCH.items():
             'toolspec/dispatch disagree for %s: spec says %s, dispatch.json says %s'
             % (_name, _spec.bridge_method, _method))
 
+def _validate_arguments(name, spec, args):
+    """Reject unknown/missing parameters before any bridge round-trip.
+
+    The whole point is to turn a hallucinated parameter (``solver=``,
+    ``sweep type=``, a typo) into a loud error instead of a silent no-op. The
+    schema is the source of truth for what is accepted; nested sweep dicts are
+    checked here too because handlers would otherwise ignore their extra keys.
+    """
+    accepted = sorted(spec.schema.get('properties', {}).keys())
+    unknown = sorted(set(args) - set(accepted))
+    if unknown:
+        raise ValueError(
+            'Unknown parameter(s) for %s: %s. Accepted: %s'
+            % (name, ', '.join(unknown), ', '.join(accepted)))
+    missing = [k for k in spec.schema.get('required', []) if k not in args]
+    if missing:
+        raise ValueError('Missing required parameter(s) for %s: %s'
+                         % (name, ', '.join(missing)))
+    if name == 'sweep_add':
+        _validate_sweep_add_args(args)
+    return args
+
+
+def _validate_sweep_add_args(args):
+    param_keys = {'name', 'parameter', 'start', 'stop', 'points', 'type'}
+    result_keys = {'name', 'result'}
+    for i, param in enumerate(args.get('parameters') or []):
+        if not isinstance(param, dict):
+            raise ValueError('sweep_add.parameters[%d] must be an object' % i)
+        extra = sorted(set(param) - param_keys)
+        if extra:
+            raise ValueError(
+                'sweep_add.parameters[%d] has unknown key(s): %s. Allowed: %s'
+                % (i, ', '.join(extra), ', '.join(sorted(param_keys))))
+    for i, result in enumerate(args.get('results') or []):
+        if not isinstance(result, dict):
+            raise ValueError('sweep_add.results[%d] must be an object' % i)
+        extra = sorted(set(result) - result_keys)
+        if extra:
+            raise ValueError(
+                'sweep_add.results[%d] has unknown key(s): %s. Allowed: %s'
+                % (i, ', '.join(extra), ', '.join(sorted(result_keys))))
+
+
 app = Server('fdtd-mcp')
 
 @app.list_tools()
@@ -482,26 +534,27 @@ async def call_tool(name: str, arguments: dict[str, Any]):
     if spec is None:
         raise ValueError('Unknown tool: ' + name)
 
+    params = dict(arguments) if arguments else {}
+    for key, value in spec.defaults.items():
+        params.setdefault(key, value)
+    params = _validate_arguments(name, spec, params)
+
     # ----------------------------------------------------------------
     # Server-side tools (NO bridge round-trip)
     # ----------------------------------------------------------------
     if spec.server_only:
         if name == 'reference_lookup':
-            return _handle_lumapi_ref(arguments)
+            return _handle_lumapi_ref(params)
         if name == 'engine_cleanup':
-            return _handle_engine_cleanup(arguments)
+            return _handle_engine_cleanup(params)
         if name == 'library_list':
-            return _handle_library_list(arguments)
+            return _handle_library_list(params)
         raise ValueError('No server-side handler for ' + name)
 
     # ----------------------------------------------------------------
     # Bridge-dispatched tools
     # ----------------------------------------------------------------
     _ensure_bridge()
-
-    params = dict(arguments) if arguments else {}
-    for key, value in spec.defaults.items():
-        params.setdefault(key, value)
 
     # Per-call timeout override for long-running tools (0 disables the bound).
     call_timeout = _CALL_TIMEOUT
@@ -512,7 +565,7 @@ async def call_tool(name: str, arguments: dict[str, Any]):
         elif launch_bound is not None:
             call_timeout = min(call_timeout, launch_bound)
     if spec.long_running:
-        t = arguments.get('timeout')
+        t = params.get('timeout')
         if t is not None:
             call_timeout = float(t) if t > 0 else 0.0
     params.pop('timeout', None)
@@ -690,6 +743,9 @@ _LSF_BUILTINS = frozenset({
     'addgroup', 'addtogroup',
     # Ports / EME / import
     'addimport', 'addmode', 'addport', 'addeme',
+    'addmodeexpansion', 'addcustom', 'addplanarsolid',
+    'addstack', 'addlayerbuilder', 'addgridattribute',
+    'gdsimport',
     # Variables & user properties.
     # NOTE: addvar/setvar/getvar/addvarfdtd were removed in v202 (verified live)
     # and are deliberately NOT allowlisted — a script using them must raise the

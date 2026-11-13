@@ -182,6 +182,58 @@ def test_model_add_auto_name_source_kind_unknown_type(bs):
     assert 'error' in r and 'Unknown object type' in r['error']['message']
 
 
+def test_model_add_v202_objects(bs):
+    """Port/mode-expansion/container/custom/planar-solid/STACK/layer-builder."""
+    bs.fresh()
+    cases = [
+        ('port', 'Port'),
+        ('mode_expansion', 'Mode Expansion Monitor'),
+        ('container_group', 'Container Group'),
+        ('custom', 'Custom'),
+        ('planar_solid', 'Planar Solid'),
+        ('stack', 'STACK'),
+        ('layer_builder', 'Layer Builder'),
+    ]
+    for obj_type, expected in cases:
+        name = 'x_' + obj_type
+        r = bs.send('model_add', {'type': obj_type, 'name': name})
+        assert r['result']['status'] == 'ok', r
+        r = bs.send('model_get', {'name': name})
+        assert r['result']['type'] == expected, r
+
+
+def test_attribute_add(bs):
+    bs.fresh()
+    r = bs.send('attribute_add', {'kind': 'lc orientation'})
+    assert r['result']['status'] == 'ok'
+    assert r['result']['name'] == 'LC attribute'
+    assert r['result']['type']
+
+    r = bs.send('attribute_add', {'kind': 'temperature', 'name': 'temp_map'})
+    assert r['result']['name'] == 'temp_map'
+    r = bs.send('model_get', {'name': 'temp_map'})
+    assert r['result']['type'] == 'Temperature'
+
+    r = bs.send('attribute_add', {'kind': 'bogus'})
+    assert 'error' in r and 'Unknown grid attribute' in r['error']['message']
+
+
+def test_import_add_gds(bs):
+    bs.fresh()
+    r = bs.send('import_add', {'path': 'chip.gds', 'cell': 'TOP', 'layer': 1})
+    assert r['result']['status'] == 'ok'
+    assert r['result']['count'] == 1
+    assert r['result']['created']
+
+    r = bs.send('import_add', {'path': 'chip.gds', 'cell': 'TOP', 'layer': 1,
+                               'zmin': -1e-7, 'zmax': 0})
+    assert 'error' in r and 'material' in r['error']['message']
+
+    r = bs.send('import_add', {'path': 'chip.gds', 'cell': 'TOP', 'layer': 1,
+                               'kind': 'stl'})
+    assert 'error' in r and 'gds' in r['error']['message']
+
+
 def test_model_info(bs):
     bs.fresh()
     bs.send('model_add', {'type': 'rectangle', 'name': 'r1'})
@@ -209,6 +261,28 @@ def test_model_info(bs):
     r = bs.send('model_info', {'enabled_only': False})
     names2 = [o['name'] for o in r['result']['objects']]
     assert 'c1' in names2
+
+
+def test_stack_report_flags_overlap_gap_and_pml(bs):
+    bs.fresh()
+    bs.send('model_add', {'type': 'rectangle', 'name': 'l1',
+                          'properties': {'z': -300e-9, 'z span': 400e-9,
+                                         'x span': 2e-6, 'y span': 2e-6}})
+    bs.send('model_add', {'type': 'rectangle', 'name': 'l2',
+                          'properties': {'z': -50e-9, 'z span': 200e-9}})
+    bs.send('model_add', {'type': 'rectangle', 'name': 'l3',
+                          'properties': {'z': 400e-9, 'z span': 100e-9}})
+
+    r = bs.send('stack_report', {})
+    res = r['result']
+    assert [l['name'] for l in res['layers']] == ['l1', 'l2', 'l3']
+    assert res['layers'][0]['thickness'] == pytest.approx(400e-9)
+    assert res['overlaps'] and res['overlaps'][0]['below'] == 'l1'
+    assert res['gaps'] and res['gaps'][0]['above'] == 'l3'
+    assert any('transverse PML' in w for w in res['warnings'])
+
+    r = bs.send('stack_report', {'include_disabled': True})
+    assert r['result']['layer_count'] == 3
 
 
 def test_model_info_group_children(bs):
@@ -319,6 +393,45 @@ def test_dead_v202_commands_are_rejected(bs):
 # material module (5 tools)
 # ---------------------------------------------------------------------------
 
+def test_material_index_anisotropic_and_constant(bs):
+    bs.fresh()
+    name = bs.send('material_add', {})['result']['name']
+    data = [[3e14, [4.0, 0.0], [9.0, 0.0], [16.0, 0.0]],
+            [4e14, [4.0, 0.0], [9.0, 0.0], [16.0, 0.0]]]
+    r = bs.send('material_set', {'name': name, 'property': 'sampled 3d data',
+                                 'value': data})
+    assert r['result']['status'] == 'ok'
+
+    r = bs.send('material_index', {'name': name, 'frequencies': [3e14],
+                                   'component': 'yy'})
+    assert r['result']['n'] == pytest.approx([3.0])
+    assert r['result']['k'] == pytest.approx([0.0])
+
+    r = bs.send('material_index', {'name': name, 'frequencies': [3e14],
+                                   'component': 'zz'})
+    assert r['result']['n'] == pytest.approx([4.0])
+
+    # out of the tabulated range -> null, not a clamp
+    r = bs.send('material_index', {'name': name, 'frequencies': [1e14]})
+    assert r['result']['n'] == [None]
+
+    # wavelength input
+    r = bs.send('material_index', {'name': name,
+                                   'wavelengths': [299792458.0 / 3e14]})
+    assert r['result']['n'] == pytest.approx([2.0])
+
+    r = bs.send('material_index', {'name': name,
+                                   'wavelengths': [1e-6], 'frequencies': [3e14]})
+    assert 'error' in r and 'not both' in r['error']['message']
+
+    # constant material
+    r = bs.send('material_add', {'type': 'Dielectric'})
+    dname = r['result']['name']
+    r = bs.send('material_index', {'name': dname, 'wavelengths': [1e-6]})
+    assert r['result']['n'] == pytest.approx([1.5])
+    assert r['result']['k'] == pytest.approx([0.0])
+
+
 def test_material_crud(bs):
     bs.fresh()
     r = bs.send('material_add', {'type': 'Dielectric'})
@@ -353,14 +466,29 @@ def test_material_sampled_data(bs):
     bs.fresh()
     r = bs.send('material_add', {})  # default 'Sampled 3D data'
     name = r['result']['name']
-    data = [[300e-9, 1.5, 0], [800e-9, 1.5, 0]]
+    data = [[3e14, [4.0, 0.1], [4.0, 0.1], [4.0, 0.1]],
+            [4e14, [4.1, 0.1], [4.1, 0.1], [4.1, 0.1]]]
     r = bs.send('material_set', {'name': name, 'property': 'sampled 3d data',
                                  'value': data})
     assert r['result']['status'] == 'ok'
+    assert r['result']['columns'] == 4
+    assert r['result']['complex'] is True
+
     r = bs.send('material_get', {'name': name, 'property': 'sampled 3d data'})
     out = r['result']
-    assert out['shape'] == [2, 3]
-    assert out['data'][0] == [3e-07, 1.5, 0.0]
+    assert out['shape'] == [2, 4]
+    assert out['data'][0][0] == [3e14, 0.0]
+    assert out['data'][0][1] == [4.0, 0.1]
+
+    # material_get's {"data": ...} output can be fed straight back.
+    r = bs.send('material_set', {'name': name, 'property': 'sampled 3d data',
+                                 'value': out})
+    assert r['result']['status'] == 'ok'
+
+    # v202 rejects 3 columns; the tool catches it before the engine call.
+    r = bs.send('material_set', {'name': name, 'property': 'sampled 3d data',
+                                 'value': [[3e14, 1.5, 0], [4e14, 1.5, 0]]})
+    assert 'error' in r and '2 columns' in r['error']['message']
 
 
 # ---------------------------------------------------------------------------
@@ -382,6 +510,10 @@ def test_sweep_crud(bs):
     r = bs.send('sweep_get', {'name': 'gap_sweep'})
     assert r['result']['exists'] is True
     assert r['result']['has_results'] is False
+    props = r['result']['properties']
+    assert 'type' in props and 'number of points' in props
+    assert 'solver' not in props            # v202 has no sweep solver
+    assert r['result']['sweep_type'] == 0
 
     r = bs.send('sweep_run', {'name': 'gap_sweep'})
     assert r['result']['status'] == 'completed'
@@ -396,13 +528,44 @@ def test_sweep_crud(bs):
     r = bs.send('sweep_result', {'name': 'gap_sweep', 'result': 'T'})
     assert set(r['result'].keys()) == {'T'}
 
-    r = bs.send('sweep_set', {'name': 'gap_sweep', 'properties': {'sweep type': 1}})
+    r = bs.send('sweep_set', {'name': 'gap_sweep', 'properties': {'type': 'Ranges'}})
     assert r['result']['status'] == 'ok'
+    assert r['result']['properties_set'] == 1
+
+    # v202 setsweep returns 0.0 for unknown properties instead of raising.
+    # That must surface as a failure, not a silent success.
+    r = bs.send('sweep_set', {'name': 'gap_sweep', 'properties': {'sweep type': 1}})
+    assert r['result']['status'] == 'error'
+    assert 'sweep type' in r['result']['failures']
+    assert 'Editable properties' in r['result']['failures']['sweep type']
+
+    r = bs.send('sweep_set', {'name': 'gap_sweep', 'properties': {'solver': 'FDTD'}})
+    assert r['result']['status'] == 'error'
+    assert 'solver' in r['result']['failures']
 
     r = bs.send('sweep_delete', {'name': 'gap_sweep'})
     assert r['result']['status'] == 'ok'
     r = bs.send('sweep_get', {'name': 'gap_sweep'})
     assert r['result']['exists'] is False
+
+
+def test_sweep_add_auto_names_and_sparam_warning(bs):
+    bs.fresh()
+    r1 = bs.send('sweep_add', {'name': 's1'})
+    r2 = bs.send('sweep_add', {'name': 's2'})
+    assert r1['result']['name'] == 's1'
+    assert r2['result']['name'] == 's2'
+    assert r2['result']['type'] == 0
+
+    r = bs.send('sweep_get', {'name': 's2'})
+    assert r['result']['exists'] is True
+    assert r['result']['sweep_type'] == 0
+
+    # S-parameter sweep without ports must be created but flagged loudly.
+    r = bs.send('sweep_add', {'name': 's3', 'type': 3})
+    assert r['result']['status'] == 'ok'
+    assert r['result']['warnings']
+    assert 'port' in r['result']['warnings'][0].lower()
 
 
 # ---------------------------------------------------------------------------
@@ -419,9 +582,17 @@ def test_result_lifecycle(bs, tmp_path):
 
     r = bs.send('run', {})
     assert r['result']['status'] == 'completed'
+    assert 'diagnostics' in r['result']
 
     r = bs.send('result_has', {'monitor': 'DFT'})
     assert r['result']['exists'] is True
+
+    # Scoped names fall back to the short name (v202 accepts both in different
+    # calls; the tool now reports which one actually worked).
+    r = bs.send('result_get', {'monitor': '::model::DFT', 'data': 'T',
+                               'fields': ['T']})
+    assert r['result']['status'] == 'ok'
+    assert r['result']['monitor'] == 'DFT'
 
     r = bs.send('result_list', {'monitor': 'DFT'})
     res = r['result']
@@ -624,6 +795,25 @@ def test_call_tool_unknown_tool(monkeypatch):
         asyncio.run(srv.call_tool('no_such_tool', {}))
 
 
+def test_call_tool_rejects_unknown_or_missing_params(monkeypatch):
+    """Hallucinated/typo parameters must fail before the bridge is touched."""
+    rec = _patch_bridge(monkeypatch)
+
+    with pytest.raises(ValueError, match='solver'):
+        asyncio.run(srv.call_tool('sweep_add',
+                                  {'name': 's', 'solver': 'FDTD'}))
+    with pytest.raises(ValueError, match='unknown key'):
+        asyncio.run(srv.call_tool('sweep_add', {
+            'name': 's',
+            'parameters': [{'name': 'x', 'solver': 'FDTD'}]}))
+    with pytest.raises(ValueError, match='Unknown parameter'):
+        asyncio.run(srv.call_tool('sweep_set', {
+            'name': 's', 'properties': {'type': 'Ranges'}, 'solver': 'FDTD'}))
+    with pytest.raises(ValueError, match='Missing required'):
+        asyncio.run(srv.call_tool('sweep_add', {}))
+    assert not rec.calls       # nothing reached the bridge
+
+
 def test_call_tool_script_warnings(monkeypatch):
     rec = _patch_bridge(monkeypatch)
     r = asyncio.run(srv.call_tool('execute', {'code': 'totallyUnknownFunc("x");'}))
@@ -719,6 +909,17 @@ def test_engine_status_reports_code_identity(bs):
     # The log holds completed calls: this one is appended once it returns.
     assert 'session_new' in [c['method'] for c in st['recent_calls']]
     assert st['fdtd_summary']['dimension'] == '3D'
+    assert st['mode'] == 'layout'
+    assert st['layout_mode'] is True
+
+
+def test_engine_status_mode_after_run(bs):
+    bs.fresh()
+    r = bs.send('run', {})
+    assert r['result']['mode'] == 'analysis'
+    r = bs.send('engine_status', {})
+    assert r['result']['mode'] == 'analysis'
+    assert r['result']['layout_mode'] is False
 
 
 def test_engine_status_works_without_project(bs):

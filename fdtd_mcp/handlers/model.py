@@ -176,6 +176,167 @@ class ModelHandlers(BridgeBase):
             'fdtd_summary': fdtd_summary,
         }
 
+    @staticmethod
+    def _as_float(value):
+        try:
+            return float(value)
+        except (TypeError, ValueError):
+            return None
+
+    def _cmd_stack_report(self, p):
+        """Geometry/PML audit for a layer stack (read-only).
+
+        Answers the questions that matter when a simulation diverges or a layer
+        silently disappears: which layers exist, their z extents, overlaps and
+        gaps, layers thinner than 1 nm, layers outside the FDTD region, and
+        structures that fill the transverse PML volume.
+        """
+        self._require_project()
+        include_disabled = bool(p.get('include_disabled', False))
+        props = ['type', 'enabled', 'material', 'mesh order',
+                 'x span', 'y span', 'z', 'z span', 'z min', 'z max']
+        objects = []
+        self._traverse('::model', props, not include_disabled, objects, set())
+
+        fdtd = {}
+        for key in ('x span', 'y span', 'z span', 'z',
+                    'x min bc', 'x max bc', 'y min bc', 'y max bc',
+                    'z min bc', 'z max bc', 'pml layers'):
+            try:
+                fdtd[key] = self._sanitize(self._fsp.getnamed('FDTD', key))
+            except Exception:
+                pass
+        fz = self._as_float(fdtd.get('z')) or 0.0
+        fzs = self._as_float(fdtd.get('z span'))
+        fzmin = fz - fzs / 2.0 if fzs else None
+        fzmax = fz + fzs / 2.0 if fzs else None
+        fxspan = self._as_float(fdtd.get('x span'))
+        fyspan = self._as_float(fdtd.get('y span'))
+        xbc = str(fdtd.get('x min bc', '') or '') + ' ' + str(fdtd.get('x max bc', '') or '')
+        ybc = str(fdtd.get('y min bc', '') or '') + ' ' + str(fdtd.get('y max bc', '') or '')
+
+        tol = 1e-12
+        layers = []
+        # Only physical layers belong in a stack report: skip solvers, groups,
+        # sources/monitors/ports, mesh regions and grid attributes.
+        skip_tokens = ('FDTD', 'STACK', 'RCWA', 'Structure Group',
+                       'Analysis Group', 'Container Group', 'Layer Builder',
+                       'Mesh', 'Monitor', 'Source', 'Port', 'Dipole', 'TFSF',
+                       'Plane Wave', 'Gaussian', 'Attribute', 'Field Region')
+        for obj in objects:
+            obj_type = str(obj.get('type') or '')
+            if any(tok in obj_type for tok in skip_tokens):
+                continue
+            zs = self._as_float(obj.get('z span'))
+            z = self._as_float(obj.get('z'))
+            z0 = self._as_float(obj.get('z min'))
+            z1 = self._as_float(obj.get('z max'))
+            if z0 is None or z1 is None:
+                if z is None:
+                    z = 0.0
+                if zs is None:
+                    continue
+                z0, z1 = z - zs / 2.0, z + zs / 2.0
+            if z1 < z0:
+                z0, z1 = z1, z0
+            thickness = z1 - z0
+            xs = self._as_float(obj.get('x span'))
+            ys = self._as_float(obj.get('y span'))
+            warns = []
+            if thickness < 1e-9:
+                warns.append('thinner than 1 nm; verify mesh resolution')
+            if fzmin is not None and (z0 < fzmin - tol or z1 > fzmax + tol):
+                warns.append('extends outside the FDTD z range')
+            if (xs is not None and ys is not None and fxspan and fyspan
+                    and xs >= fxspan - tol and ys >= fyspan - tol
+                    and ('PML' in xbc.upper() or 'PML' in ybc.upper())):
+                warns.append('fills the transverse PML volume (x/y spans match '
+                             'the FDTD region while x/y use PML)')
+            layers.append({
+                'name': obj.get('name'), 'type': obj.get('type'),
+                'material': obj.get('material'), 'mesh_order': obj.get('mesh order'),
+                'enabled': obj.get('enabled', True),
+                'z_min': z0, 'z_max': z1, 'thickness': thickness,
+                'warnings': warns,
+            })
+        layers.sort(key=lambda x: (x['z_min'], x['z_max']))
+
+        overlaps = []
+        gaps = []
+        for prev, cur in zip(layers, layers[1:]):
+            if cur['z_min'] < prev['z_max'] - tol:
+                overlaps.append({'below': prev['name'], 'above': cur['name'],
+                                 'overlap': prev['z_max'] - cur['z_min']})
+            elif cur['z_min'] > prev['z_max'] + tol:
+                gaps.append({'below': prev['name'], 'above': cur['name'],
+                             'gap': cur['z_min'] - prev['z_max']})
+
+        warnings = []
+        for layer in layers:
+            for w in layer['warnings']:
+                warnings.append('%s: %s' % (layer['name'], w))
+        return {
+            'fdtd': fdtd,
+            'fdtd_z_min': fzmin,
+            'fdtd_z_max': fzmax,
+            'layer_count': len(layers),
+            'layers': layers,
+            'overlaps': overlaps,
+            'gaps': gaps,
+            'warnings': warnings,
+        }
+
+    def _root_object_names(self):
+        """Names of root-level objects (after an import/creation diff)."""
+        self._fsp.eval('groupscope("::model"); selectall();')
+        raw = self._call_lsf('getid')
+        return [n.strip() for n in str(raw or '').split('\n') if n.strip()]
+
+    def _cmd_import_add(self, p):
+        """Import a GDSII layer as structures (v202 gdsimport)."""
+        self._require_project()
+        kind = str(p.get('kind') or 'gds').strip().lower()
+        if kind != 'gds':
+            raise BridgeError('only kind="gds" is supported so far')
+        path = p['path']
+        cell = p['cell']
+        try:
+            layer = int(p['layer'])
+        except (TypeError, ValueError):
+            raise BridgeError('layer must be an integer')
+        material = p.get('material')
+        zmin = p.get('zmin')
+        zmax = p.get('zmax')
+        if (zmin is None) != (zmax is None):
+            raise BridgeError('pass both zmin and zmax, or neither')
+        if zmin is not None and not material:
+            raise BridgeError('the zmin/zmax form of gdsimport requires material=')
+
+        # gdsimport creates at the current group scope; always import at root.
+        try:
+            self._fsp.eval('groupscope("::model");')
+        except Exception:
+            pass
+        before = set(self._root_object_names())
+        try:
+            if zmin is not None:
+                count = self._call_lsf('gdsimport', path, cell, layer,
+                                       material, zmin, zmax)
+            elif material:
+                count = self._call_lsf('gdsimport', path, cell, layer, material)
+            else:
+                count = self._call_lsf('gdsimport', path, cell, layer)
+        except Exception as e:
+            raise BridgeError('gdsimport failed: %s' % str(e)[:_ERR_MSG])
+        after = self._root_object_names()
+        created = [n for n in after if n not in before]
+        try:
+            count = int(count)
+        except (TypeError, ValueError):
+            count = len(created)
+        return {'status': 'ok', 'kind': 'gds', 'count': count,
+                'created': created[:50]}
+
     def _cmd_model_get(self, p):
         """Get full properties of ONE named object with type discriminator.
         For groups and ::model, also returns scripts and variables.
@@ -249,11 +410,29 @@ class ModelHandlers(BridgeBase):
             'movie_monitor': 'addmovie',
             'structure_group': 'addstructuregroup',
             'analysis_group': 'addanalysisgroup',
+            # v202-verified adders (2026-11): the GUI groups Port / Monitors /
+            # Groups / Structures / Simulation expose these too.
+            'port': 'addport',
+            'mode_expansion': 'addmodeexpansion',
+            'container_group': 'addgroup',
+            'custom': 'addcustom',
+            'planar_solid': 'addplanarsolid',
+            'stack': 'addstack',
+            'layer_builder': 'addlayerbuilder',
         }
         func = TYPE_MAP.get(obj_type)
         if not func:
             raise RuntimeError('Unknown object type: ' + obj_type +
                                '. Use one of: ' + ', '.join(sorted(TYPE_MAP.keys())))
+
+        # Verified live on v202: a port is a child of the FDTD solver's
+        # "ports" group, so addport fails without a solver region.
+        if obj_type == 'port':
+            try:
+                self._call_lsf('getnamed', 'FDTD', 'type')
+            except Exception:
+                raise BridgeError('port requires an FDTD solver region; '
+                                  'add model_add(type="fdtd") first')
 
         # Navigate scope (always restored, even when creation fails).
         try:

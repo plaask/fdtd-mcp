@@ -87,7 +87,7 @@ claude mcp add fdtd -- python -m fdtd_mcp.server
 
 通过 DSH 官方插件 `@deepseek-ai/dsh-mcp-client`（随每个 `dsh` 安装自带）桥接本
 MCP 服务器，工具以 `mcp__fdtd__*` 形式供 DSH 调用（如 `mcp__fdtd__execute`、
-`mcp__fdtd__run`、`mcp__fdtd__model_add`，共 34 个）。
+`mcp__fdtd__run`、`mcp__fdtd__model_add`，共 38 个）。
 
 **注册步骤：**
 
@@ -101,11 +101,11 @@ MCP 服务器，工具以 `mcp__fdtd__*` 形式供 DSH 调用（如 `mcp__fdtd__
       config:
         serverName: fdtd
         transport: stdio
-        command: D:/coding/anaconda3/python.exe   # ← 改成你的 Python ≥3.10（需装有 mcp 包）
+        command: python   # ← 改成你的 Python ≥3.10（需装有 mcp 包）
         args: ['-m', 'fdtd_mcp.server']
         env:
-          PYTHONPATH: D:/project/fdtd-mcp          # ← 改成你的仓库目录；若已 pip install . 可删掉
-        cwd: D:/project/fdtd-mcp                   # ← 同上
+          PYTHONPATH: <repo>          # ← 改成你的仓库目录；若已 pip install . 可删掉
+        cwd: <repo>                   # ← 同上
         failOnStartupError: false                  # Lumerical 未就绪时只跳过工具注册，不影响 GUI 启动
 ```
 
@@ -122,17 +122,19 @@ MCP 服务器，工具以 `mcp__fdtd__*` 形式供 DSH 调用（如 `mcp__fdtd__
 `$DSH_HOME/profiles/<name>/cordis.patch.yml`，或加到对所有 profile 生效的
 `$DSH_HOME/cordis.patch.yml` 即可。此集成与 Claude Code 的 `.mcp.json` 互不影响。
 
-## 工具（34 个，7 个模块）
+## 工具（38 个，8 个模块）
 
 ```
 session (5)     session_open, session_new, session_close,
                 session_save, session_save_as
 
-model (6)       model_info, model_add, model_get, model_set,
-                model_delete, model_script
+model (8)       model_info, stack_report, import_add, model_add, model_get,
+                model_set, model_delete, model_script
 
-material (5)    material_add, material_get, material_set,
-                material_delete, material_exists
+material (6)    material_add, material_get, material_set, material_delete,
+                material_exists, material_index
+
+attribute (1)   attribute_add
 
 sweep (6)       sweep_add, sweep_get, sweep_set, sweep_delete,
                 sweep_run, sweep_result
@@ -162,12 +164,22 @@ sweep_add(..., parameters=[{"name": "gap", "parameter": "::model::gap",
 | 模块 | 用途 | 工具 |
 |------|------|------|
 | **session** | 工程文件生命周期 | `session_open`, `session_new`, `session_close`, `session_save`, `session_save_as` |
-| **model** | 对象树统一 CRUD | `model_info`, `model_add`, `model_get`, `model_set`, `model_delete`, `model_script` |
-| **material** | 材料数据库 | `material_add`, `material_get`, `material_set`, `material_delete`, `material_exists` |
+| **model** | 对象树统一 CRUD | `model_info`, `stack_report`, `import_add`, `model_add`, `model_get`, `model_set`, `model_delete`, `model_script` |
+| **material** | 材料数据库 | `material_add`, `material_get`, `material_set`, `material_delete`, `material_exists`, `material_index` |
+| **attribute** | 网格属性（Attributes 组） | `attribute_add` |
 | **sweep** | 参数扫描生命周期 | `sweep_add`, `sweep_get`, `sweep_set`, `sweep_delete`, `sweep_run`, `sweep_result` |
 | **result** | 仿真数据 | `result_list`, `result_get`, `result_save`, `result_has` |
 | **engine** | 直接操作引擎 | `run`, `execute`, `execute_file`, `reference_lookup`, `engine_status`, `engine_cleanup` |
 | **library** | Lumerical 对象库 | `library_list`, `library_insert` |
+
+新增能力（v202 实测）：
+
+* `attribute_add` 创建 GUI Attributes 组的 5 种 grid attribute（LC orientation / permittivity rotation / matrix transform / np density / temperature）。
+* `model_add` 新增 `port`、`mode_expansion`、`container_group`、`custom`、`planar_solid`、`stack`、`layer_builder`；`port` 需要先有 FDTD 区域。
+* `material_index` 按 xx/yy/zz 采样各向异性材料；`material_set` 的 `sampled 3d data` 4 列是 `[f, eps_xx, eps_yy, eps_zz]`（频率 Hz + 复介电常数，不是 n/k）。
+* `stack_report` 按 z 排序并标出重叠、间隙、薄层、超出 FDTD z 范围、填满横向 PML 的结构。
+* `import_add` 先用 GDSII（`gdsimport`）；STL/表面/Image 后续。
+* `sweep_set` 会检查 `setsweep` 的 0/1 返回值；未知属性（如 `solver`）报 `status: error`，不再静默成功。
 
 ### 对象库（结构组 / 分析组）
 
@@ -233,13 +245,14 @@ session_save(path="new_sim.fsp")
 ```
 material_add(type="Sampled 3D data")                 → {name: "material_1"}
 material_set(name="material_1", property="name", value="PA_RCP")
+# 2 列 = [f(Hz), eps]（各向同性）；4 列 = [f, eps_xx, eps_yy, eps_zz]
+# eps = n^2，复介电常数可以写成 [re, im]
 material_set(name="material_1", property="sampled 3d data",
-             value=[[300e-9,1.5,0],[800e-9,1.5,0]])
+             value=[[3e14, [4.0, 0.0]], [4e14, [4.1, 0.05]]])
 material_set(name="material_1", property="mesh order", value=2)
 model_set(name="substrate", properties={"material": "PA_RCP"})
 
-# 或者从文件导入
-execute('importnk("D:/data/nk_data.txt")')
+# importnk() 作用于 import 对象，不是材料；材料数据用上面的 set 写入
 ```
 
 ### 结构组与分析组
@@ -331,8 +344,8 @@ fdtd-mcp/
 │   │   │                     #   TerminateProcess 强杀）
 │   │   ├── library.py        # 对象库目录（Resources/fdtd-library）
 │   │   └── base.py           # 共享 mix-in（_call_lsf / 清洗 / 名称解析）
-│   ├── handlers/      # 按模块拆分的处理器：session/model/material/sweep/
-│   │                  #   result/library/engine_tools
+│   ├── handlers/      # 按模块拆分的处理器：session/model/material/attribute/
+│   │                  #   sweep/result/library/engine_tools
 │   ├── server.py      # MCP 服务器（系统 Python）
 │   └── cheatsheet/
 │       └── lumapi_ref.json  # Lumerical API 参考（每条带 verified_against）

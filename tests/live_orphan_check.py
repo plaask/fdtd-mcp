@@ -23,9 +23,11 @@ import time
 from pathlib import Path
 
 PKG = str(Path(__file__).resolve().parents[1])
-os.environ.setdefault('LUMERICAL_HOME', os.environ.get(
-    'LUMERICAL_HOME', r'D:\Software\Lumerical\v202'))
 sys.path.insert(0, PKG)
+
+from fdtd_mcp.discovery import find_lumerical  # noqa: E402
+if not os.environ.get('LUMERICAL_HOME'):
+    os.environ['LUMERICAL_HOME'] = find_lumerical()
 
 from fdtd_mcp.engine import proctree  # noqa: E402
 

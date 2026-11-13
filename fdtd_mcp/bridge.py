@@ -64,6 +64,7 @@ from fdtd_mcp.engine.capabilities import code_id, VERIFIED_AGAINST     # noqa: E
 from fdtd_mcp.handlers.session import SessionHandlers                  # noqa: E402
 from fdtd_mcp.handlers.model import ModelHandlers                      # noqa: E402
 from fdtd_mcp.handlers.material import MaterialHandlers                # noqa: E402
+from fdtd_mcp.handlers.attribute import AttributeHandlers              # noqa: E402
 from fdtd_mcp.handlers.sweep import SweepHandlers                      # noqa: E402
 from fdtd_mcp.handlers.result import ResultHandlers                    # noqa: E402
 from fdtd_mcp.handlers.library import LibraryHandlers                  # noqa: E402
@@ -88,8 +89,8 @@ _TRACE_LIMIT = 50          # calls kept for engine_status
 
 
 class FdtdBridge(SessionHandlers, ModelHandlers, MaterialHandlers,
-                 SweepHandlers, ResultHandlers, LibraryHandlers,
-                 EngineHandlers, BridgeBase):
+                 AttributeHandlers, SweepHandlers, ResultHandlers,
+                 LibraryHandlers, EngineHandlers, BridgeBase):
     """Dispatch table + session state; behaviour lives in the handler mix-ins."""
 
     def __init__(self):

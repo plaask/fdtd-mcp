@@ -49,6 +49,23 @@ class BridgeBase(object):
                 raise
         self._fsp.select('::model::' + name)
 
+    def _layout_mode(self):
+        """True in layout mode, False in analysis mode, None if unreadable.
+
+        Verified against Lumerical docs: layoutmode returns 1 for layout and 0
+        for analysis; switchtolayout returns to layout mode.
+        """
+        try:
+            return bool(self._call_lsf('layoutmode'))
+        except Exception:
+            return None
+
+    def _mode_name(self):
+        mode = self._layout_mode()
+        if mode is None:
+            return None
+        return 'layout' if mode else 'analysis'
+
     def _resolve_name(self, name):
         """Resolve a possibly-short object name to its full scoped path.
 
@@ -87,7 +104,7 @@ class BridgeBase(object):
                 try:
                     import numpy as np
                     arr = np.array(a)
-                    if arr.dtype.kind in ('i', 'f', 'u'):
+                    if arr.dtype.kind in ('i', 'f', 'u', 'c'):
                         a = arr
                 except Exception:
                     pass

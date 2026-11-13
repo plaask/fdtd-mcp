@@ -147,6 +147,13 @@ class FakeFDTD(object):
         'addmovie': ('Movie Monitor', 'movie'),
         'addstructuregroup': ('Structure Group', 'structuregroup'),
         'addanalysisgroup': ('Analysis Group', 'analysisgroup'),
+        'addport': ('Port', 'port'),
+        'addmodeexpansion': ('Mode Expansion Monitor', 'mode expansion'),
+        'addgroup': ('Container Group', 'group'),
+        'addcustom': ('Custom', 'custom'),
+        'addplanarsolid': ('Planar Solid', 'planar solid'),
+        'addstack': ('STACK', 'STACK'),
+        'addlayerbuilder': ('Layer Builder', 'layer builder'),
     }
     MONITOR_TYPES = ('Power Monitor', 'DFT Monitor', 'Index Monitor',
                      'Field Monitor', 'Movie Monitor')
@@ -183,6 +190,7 @@ class FakeFDTD(object):
         self._saved = []
         self._feval_calls = []
         self._run_count = 0
+        self._mode = 'layout'
         self._closed = False
         self._eval_log = []
         self._appcall_log = []
@@ -428,6 +436,7 @@ class FakeFDTD(object):
     def run(self):
         self._run_count += 1
         self._populate_results()
+        self._mode = 'analysis'
 
     def runsweep(self, name):
         sw = self._sweeps.get(name)
@@ -481,6 +490,13 @@ class FakeFDTD(object):
 
     def _appcall(self, func_name, args):
         self._appcall_log.append((func_name, list(args)))
+
+        if func_name == 'layoutmode':
+            return 1.0 if self._mode == 'layout' else 0.0
+
+        if func_name == 'switchtolayout':
+            self._mode = 'layout'
+            return None
 
         if func_name == 'getid':
             return '\n'.join(n for n, o in self._objects.items()
@@ -554,9 +570,53 @@ class FakeFDTD(object):
                 obj.props[prop] = value
             return None
 
+        if func_name == 'addgridattribute':
+            if len(args) != 1:
+                raise RuntimeError(
+                    'argument list for addgridattribute command is incorrect')
+            table = {
+                'lc orientation': ('LC Attribute', 'LC attribute'),
+                'permittivity rotation': ('Permittivity Rotation',
+                                          'Rotation attribute'),
+                'matrix transform': ('Matrix Transform', 'Matrix attribute'),
+                'np density': ('np Density', 'np density'),
+                'temperature': ('Temperature', 'temperature'),
+            }
+            spec = table.get(str(args[0]).lower())
+            if spec is None:
+                raise RuntimeError('unknown grid attribute type: %s' % (args[0],))
+            type_str, base = spec
+            name = self._next_name(base)
+            obj = _Obj(type_str)
+            obj.scope = self._scope
+            obj.props['name'] = name
+            obj.props['enabled'] = True
+            self._apply_defaults(obj)
+            self._objects[name] = obj
+            self._selected = name
+            return None
+
+        if func_name == 'addport' and 'FDTD' not in self._objects:
+            raise RuntimeError('port requires an FDTD solver region')
+
         if func_name in self.ADD:
             self._create_object(func_name)
             return None
+
+        if func_name == 'gdsimport':
+            if len(args) < 3:
+                raise RuntimeError('argument list for gdsimport command is incorrect')
+            name = self._next_name('gds')
+            obj = _Obj('Polygon')
+            obj.scope = self._scope
+            obj.props['name'] = name
+            obj.props['enabled'] = True
+            self._apply_defaults(obj)
+            if len(args) >= 4 and args[3]:
+                obj.props['material'] = args[3]
+            self._objects[name] = obj
+            self._selected = name
+            return 1.0
 
         if func_name == 'addobject':
             if len(args) != 1:
@@ -712,14 +772,28 @@ class FakeFDTD(object):
         # ---- sweeps ----
         if func_name == 'addsweep':
             stype = args[0] if args else 0
-            self._sweeps['sweep'] = {'type': stype, 'props': {'name': 'sweep'},
-                                     'parameters': {}, 'results_def': {},
-                                     'results': None}
-            return '::sweep'  # real engine returns the created sweep path
+            base = {0: 'sweep', 1: 'optimization',
+                    2: 'Monte Carlo analysis', 3: 's-parameter sweep'}.get(
+                        stype, 'sweep')
+            name = base
+            n = 1
+            while name in self._sweeps:
+                name = base + str(n)
+                n += 1
+            self._sweeps[name] = {'type': stype, 'props': {'name': name},
+                                  'parameters': {}, 'results_def': {},
+                                  'results': None}
+            return '::' + name  # real engine returns the created sweep path
 
         if func_name == 'setsweep':
-            self._setsweep(*args)
-            return None
+            return self._setsweep(*args)
+
+        if func_name == 'getsweep':
+            name = args[0]
+            sw = self._sweeps.get(name)
+            if sw is None:
+                raise KeyError('sweep not found: ' + name)
+            return self._sweep_props(sw)
 
         if func_name == 'addsweepparameter':
             name, spec = args[0], args[1]
@@ -805,26 +879,67 @@ class FakeFDTD(object):
         self._eval_log.append('FAKE-UNSUPPORTED: %s%r' % (func_name, args))
         raise RuntimeError('FakeEngine: unsupported function: %s' % func_name)
 
+    _SWEEP_DEFAULTS = {
+        0: ['name', 'type', 'number of points', 'resave files after analysis'],
+        1: ['name', 'algorithm', 'maximum generations', 'reset random generator',
+            'type', 'generation size', 'tolerance', 'first generation script',
+            'next generation script', 'use figure of merit script',
+            'figure of merit script'],
+        2: ['name', 'number of trials', 'variation', 'seed', 'enable seed',
+            'individual trial', 'enable individual trial',
+            'enable spatial correlations'],
+        3: ['name', 'excite all ports', 'calculate group delay', 'invert sign',
+            'map from', 'active', 'port', 'mode', 'map vector',
+            'auto symmetry', 'export setup'],
+    }
+
+    def _sweep_props(self, sw):
+        """Mirror ?setsweep(name) on v202: defaults + added parameter names."""
+        props = list(self._SWEEP_DEFAULTS.get(sw.get('type', 0), []))
+        for pname in sw.get('parameters', {}):
+            if pname not in props:
+                props.append(pname)
+        return '\n'.join(props)
+
     def _setsweep(self, *args):
-        if len(args) == 3:
-            name, dotted, value = args
+        if len(args) == 1:
+            name = args[0]
             sw = self._sweeps.get(name)
             if sw is None:
                 raise KeyError('sweep not found: ' + name)
-            if '::' in dotted:
-                obj, prop = dotted.split('::', 1)
-                self._set_sweep_target(name, obj, prop, value)
-            elif dotted == 'name':
+            return self._sweep_props(sw)
+        if len(args) == 3:
+            name, prop, value = args
+            sw = self._sweeps.get(name)
+            if sw is None:
+                raise KeyError('sweep not found: ' + name)
+            editable = self._sweep_props(sw).split('\n')
+            if prop == 'name':
                 newname = value
                 if newname != name:
                     self._sweeps[newname] = self._sweeps.pop(name)
                 sw['props']['name'] = newname
+                return 1.0
+            if prop not in editable:
+                # v202 fidelity: unknown property -> 0.0, no exception.
+                return 0.0
+            if prop == 'type' and value not in ('Ranges', 'Values'):
+                return 0.0
+            if prop == 'number of points':
+                try:
+                    if int(value) <= 0:
+                        return 0.0
+                except (TypeError, ValueError):
+                    return 0.0
+            if prop in sw['parameters']:
+                sw['parameters'][prop]['value'] = value
             else:
-                sw['props'][dotted] = value
-        elif len(args) == 4:
-            self._set_sweep_target(*args)
-        else:
-            raise TypeError('setsweep expects 3 or 4 args')
+                sw['props'][prop] = value
+            return 1.0
+        if len(args) == 4:
+            ok = self._set_sweep_target(*args)
+            return 1.0 if ok else 0.0
+        raise TypeError('setsweep expects 1, 3 or 4 args')
 
     def _set_sweep_target(self, name, obj, prop, value):
         sw = self._sweeps.get(name)
@@ -832,10 +947,11 @@ class FakeFDTD(object):
             raise KeyError('sweep not found: ' + name)
         if obj in sw['parameters']:
             sw['parameters'][obj][prop] = value
-        elif obj in sw['results_def']:
+            return True
+        if obj in sw['results_def']:
             sw['results_def'][obj][prop] = value
-        else:
-            sw['props'][obj + '_' + prop] = value
+            return True
+        return False
 
 
 # ---------------------------------------------------------------------------

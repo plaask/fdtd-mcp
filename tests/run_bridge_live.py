@@ -19,10 +19,8 @@ ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, ROOT)
 
 if not os.environ.get('LUMERICAL_HOME'):
-    for cand in ('D:/Software/Lumerical/v202',):
-        if os.path.isdir(cand):
-            os.environ['LUMERICAL_HOME'] = cand
-            break
+    from fdtd_mcp.discovery import find_lumerical
+    os.environ['LUMERICAL_HOME'] = find_lumerical()
 
 import fdtd_mcp.bridge as bridge_mod  # noqa: E402
 
@@ -143,6 +141,49 @@ def main():
     check('runsetup executes the group script', r.get('status') == 'ok', r)
     r = call(b, 'execute', code='?getnamed("::model::dbr::layer1","type")')
     check('group child created by its script', r.get('result') == 'Rectangle', r)
+
+    # --- sweep config is readable, and a fake "solver" fails loudly --------
+    r = call(b, 'sweep_get', name='gap_sweep')
+    check('sweep_get exposes editable properties',
+          'type' in (r.get('properties') or []) and r.get('sweep_type') == 0, r)
+    check('sweep_get does not invent solver',
+          'solver' not in (r.get('properties') or []), r)
+    r = call(b, 'sweep_set', name='gap_sweep', properties={'solver': 'FDTD'})
+    check('sweep_set rejects solver loudly',
+          r.get('status') == 'error' and 'solver' in (r.get('failures') or {}), r)
+    r = call(b, 'sweep_set', name='gap_sweep', properties={'type': 'Ranges'})
+    check('sweep_set applies type=Ranges',
+          r.get('status') == 'ok' and r.get('properties_set') == 1, r)
+
+    # --- Attributes group --------------------------------------------------
+    r = call(b, 'attribute_add', kind='lc orientation')
+    check('attribute_add lc orientation', r.get('name') == 'LC attribute', r)
+    r = call(b, 'attribute_add', kind='temperature', name='temp_map')
+    check('attribute_add temperature rename', r.get('name') == 'temp_map', r)
+
+    # --- v202 object adders the catalogue used to lack ---------------------
+    for obj_type in ('port', 'mode_expansion', 'container_group', 'custom',
+                     'planar_solid', 'stack', 'layer_builder'):
+        name = 'live_' + obj_type
+        r = call(b, 'model_add', type=obj_type, name=name)
+        check('model_add ' + obj_type, r.get('name') == name, r)
+
+    r = call(b, 'stack_report')
+    check('stack_report finds layers',
+          r.get('layer_count', 0) >= 1 and bool(r.get('fdtd')), r)
+
+    # --- complex sampled material + anisotropic index ----------------------
+    r = call(b, 'material_add', type='Sampled 3D data')
+    mname = r.get('name')
+    data = [[3e14, [4.0, 0.1], [9.0, 0.1], [16.0, 0.1]],
+            [4e14, [4.0, 0.1], [9.0, 0.1], [16.0, 0.1]]]
+    r = call(b, 'material_set', name=mname, property='sampled 3d data', value=data)
+    check('material_set complex sampled data',
+          r.get('status') == 'ok' and r.get('complex') is True, r)
+    r = call(b, 'material_index', name=mname, frequencies=[3e14],
+             component='yy')
+    n = (r.get('n') or [None])[0]
+    check('material_index yy component', n is not None and abs(n - 3.0) < 0.01, r)
 
     try:
         call(b, 'session_close')

@@ -40,3 +40,4 @@ CLAUDE.local.md
 # Development docs — architecture review, engine-verification probes and notes.
 # Read locally, nothing here is imported or read by the MCP at runtime.
 docs/
+.dsh/dshmm/mcp.json

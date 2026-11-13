@@ -1,7 +1,7 @@
 {
   "meta": {
     "scope": "Commonly-used Lumerical script API subset — NOT exhaustive. If a function is not listed here, do NOT assume its signature; call reference_lookup(list_only=true) or check Lumerical documentation.",
-    "verified_against": "pending",
+    "verified_against": "v202 (2020 R2) - live engine probes 2026-09/2026-11",
     "note": "Each entry's verified_against should be updated to the Lumerical version (e.g. '241') after live verification. Mark 'pending' until then."
   },
   "getresult": {
@@ -561,5 +561,155 @@
     ],
     "category": "object",
     "verified_against": "v202 - live engine probes 2026-09"
+  },
+  "addport": {
+    "signature": "addport()  or  addport(struct)",
+    "returns": "none (creates a Port object under the FDTD solver's \"ports\" group)",
+    "valid_args": {},
+    "common_pitfalls": [
+      "Verified live on v202 (2026-11): addport succeeds when an FDTD solver region exists",
+      "A port acts as a mode source + field monitor + mode expansion monitor; use it with sweep_add(type=3) for S-parameters",
+      "The port group is created automatically as FDTD::ports; ports cannot be moved out of it"
+    ],
+    "category": "object",
+    "verified_against": "v202 - live engine probes 2026-11"
+  },
+  "addmodeexpansion": {
+    "signature": "addmodeexpansion()",
+    "returns": "none (creates a mode expansion monitor)",
+    "valid_args": {},
+    "common_pitfalls": [
+      "Verified live on v202 (2026-11); it needs a monitor/FDTD context like the other monitor adders",
+      "Configure the expansion mode and frequency points with setnamed after creation"
+    ],
+    "category": "monitor",
+    "verified_against": "v202 - live engine probes 2026-11"
+  },
+  "addgroup": {
+    "signature": "addgroup()",
+    "returns": "none (creates a container group)",
+    "valid_args": {},
+    "common_pitfalls": [
+      "Verified live on v202 (2026-11); the object type is a container group, not a structure/analysis group",
+      "Use groupscope or addtogroup to place children inside it"
+    ],
+    "category": "object",
+    "verified_against": "v202 - live engine probes 2026-11"
+  },
+  "addcustom": {
+    "signature": "addcustom()",
+    "returns": "none (creates a custom primitive)",
+    "valid_args": {},
+    "common_pitfalls": [
+      "Verified live on v202 (2026-11)",
+      "Set the boundary equations through the object properties after creation"
+    ],
+    "category": "object",
+    "verified_against": "v202 - live engine probes 2026-11"
+  },
+  "addplanarsolid": {
+    "signature": "addplanarsolid()",
+    "returns": "none (creates a planar solid structure)",
+    "valid_args": {},
+    "common_pitfalls": [
+      "Verified live on v202 (2026-11); object type is \"solid\" in the tree"
+    ],
+    "category": "object",
+    "verified_against": "v202 - live engine probes 2026-11"
+  },
+  "addstack": {
+    "signature": "addstack()",
+    "returns": "none (creates the STACK simulation object)",
+    "valid_args": {},
+    "common_pitfalls": [
+      "Verified live on v202 (2026-11): creation succeeds; running it requires a STACK license (documented)",
+      "STACK is a 1D multilayer solver, separate from the FDTD solver region"
+    ],
+    "category": "object",
+    "verified_against": "v202 - live engine probes 2026-11"
+  },
+  "addlayerbuilder": {
+    "signature": "addlayerbuilder()",
+    "returns": "none (creates a layer-builder structure group)",
+    "valid_args": {},
+    "common_pitfalls": [
+      "Verified live on v202 (2026-11); object type is a layer group",
+      "Useful for GDS/layer-stack workflows; configure its layers through its script/properties"
+    ],
+    "category": "object",
+    "verified_against": "v202 - live engine probes 2026-11"
+  },
+  "addgridattribute": {
+    "signature": "addgridattribute(\"type\")  or  addgridattribute(\"type\", dataset)",
+    "returns": "none (creates a root-level grid attribute object)",
+    "valid_args": {
+      "type": "\"lc orientation\", \"permittivity rotation\", \"matrix transform\", \"np density\", \"temperature\""
+    },
+    "common_pitfalls": [
+      "Verified live on v202 (2026-11): all five types exist",
+      "Auto names: \"LC attribute\", \"Rotation attribute\", \"Matrix attribute\", \"np density\", \"temperature\"",
+      "A grid attribute is a separate object, not a material property; pair it with an index-perturbation material model where needed"
+    ],
+    "category": "attribute",
+    "verified_against": "v202 - live engine probes 2026-11"
+  },
+  "gdsimport": {
+    "signature": "n = gdsimport(\"file\", \"cell\", layer [, \"material\" [, zmin, zmax]])",
+    "returns": "number of imported objects (float)",
+    "valid_args": {
+      "file": "path to a .gds file",
+      "cell": "GDS cell name",
+      "layer": "GDS layer number",
+      "material": "optional material name",
+      "zmin/zmax": "optional extrusion range; only valid in 3D layouts"
+    },
+    "common_pitfalls": [
+      "Verified live on v202 (2026-11): the command exists (an empty call reports \"Problem processing arguments\", not \"not a valid function\")",
+      "Requires layout mode; after a run, switchtolayout first",
+      "The zmin/zmax form requires a material argument"
+    ],
+    "category": "import",
+    "verified_against": "v202 - live command-table + argument probe 2026-11"
+  },
+  "getsweep": {
+    "signature": "getsweep(\"name\")",
+    "returns": "newline-separated editable property names",
+    "valid_args": {
+      "name": "sweep name"
+    },
+    "common_pitfalls": [
+      "Verified live on v202 (2026-11): a parameter sweep lists name / type / number of points / resave files after analysis",
+      "There is NO solver property in that list; setsweep(...,\"solver\",...) returns 0.0",
+      "This is a property-name list, not a value dump"
+    ],
+    "category": "sweep",
+    "verified_against": "v202 - live engine probes 2026-11"
+  },
+  "setsweep": {
+    "signature": "setsweep(\"name\", \"property\", value)",
+    "returns": "1.0 on success, 0.0 on failure — does NOT raise for an unknown property",
+    "valid_args": {
+      "name": "sweep name",
+      "property": "an editable property name",
+      "value": "new value"
+    },
+    "common_pitfalls": [
+      "Verified live on v202 (2026-11): setsweep(\"sweep\",\"solver\",\"FDTD\") returns 0.0; setsweep(\"sweep\",\"type\",\"Ranges\") returns 1.0",
+      "A caller that ignores the return value turns every typo into a silent success",
+      "Use getsweep(name) / setsweep(name) to list the editable properties first"
+    ],
+    "category": "sweep",
+    "verified_against": "v202 - live engine probes 2026-11"
+  },
+  "layoutmode": {
+    "signature": "layoutmode()",
+    "returns": "1 in layout mode, 0 in analysis mode",
+    "valid_args": {},
+    "common_pitfalls": [
+      "Documented on v202: use switchtolayout() to return to layout mode",
+      "Adding/modifying objects is only allowed in layout mode"
+    ],
+    "category": "general",
+    "verified_against": "Lumerical docs; mirrored by the fake engine"
   }
 }

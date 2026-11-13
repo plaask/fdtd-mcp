@@ -15,7 +15,7 @@ from ..engine.constants import (ERR_MSG as _ERR_MSG,
                                LSF_PROP_TYPES as _LSF_PROP_TYPES,
                                RUN_COMMAND as _RUN_COMMAND)
 from ..engine.base import BridgeBase
-from ..engine.capabilities import (ANALYSIS_RESULT_FUNCTION,
+from ..engine.capabilities import (ANALYSIS_RESULT_FUNCTION, IMPORT_KINDS,
                                    OBJECT_TYPES, user_prop_function)
 from ..engine.errors import BridgeError
 from ..engine.lsf import lsf_quote
@@ -297,12 +297,45 @@ class ModelHandlers(BridgeBase):
         return [n.strip() for n in str(raw or '').split('\n') if n.strip()]
 
     def _cmd_import_add(self, p):
-        """Import a GDSII layer as structures (v202 gdsimport)."""
+        """Import GDS/STL/surface/binary/nk/STEP data (v202-gated)."""
         self._require_project()
         kind = str(p.get('kind') or 'gds').strip().lower()
-        if kind != 'gds':
-            raise BridgeError('only kind="gds" is supported so far')
+        spec = IMPORT_KINDS.get(kind)
+        if spec is None:
+            raise BridgeError('Unknown import kind %r. Supported: %s'
+                              % (p.get('kind'),
+                                 ', '.join(sorted(IMPORT_KINDS))))
+        if kind == 'gds':
+            return self._import_gds(p)
+        if kind == 'stl':
+            return self._import_stl(p)
+        if kind in ('surface', 'binary', 'nk'):
+            return self._import_primitive(kind, p)
+        if kind == 'step':
+            return self._import_step(p)
+        raise BridgeError(spec.get('notes') or
+                          'import kind "%s" is not available on this engine'
+                          % kind)
+
+    @staticmethod
+    def _reject_import_options(p, allowed, kind):
+        for key in ('cell', 'layer', 'zmin', 'zmax', 'scale_factor',
+                    'vertex_radius', 'debug', 'file_units', 'x0', 'y0', 'z0',
+                    'upper_surface', 'invert_xy', 'reverse_index_order'):
+            if key not in allowed and p.get(key) is not None:
+                raise BridgeError('%s is not valid for kind="%s"' % (key, kind))
+
+    def _delete_quietly(self, name):
+        try:
+            self._fsp.eval('select(%s); delete();' % lsf_quote(name))
+        except Exception:
+            pass
+
+    def _import_gds(self, p):
+        self._reject_import_options(p, {'cell', 'layer', 'zmin', 'zmax'}, 'gds')
         path = p['path']
+        if p.get('cell') is None or p.get('layer') is None:
+            raise BridgeError('kind="gds" requires cell= and layer=')
         cell = p['cell']
         try:
             layer = int(p['layer'])
@@ -334,12 +367,188 @@ class ModelHandlers(BridgeBase):
             raise BridgeError('gdsimport failed: %s' % str(e)[:_ERR_MSG])
         after = self._root_object_names()
         created = [n for n in after if n not in before]
+        warnings = []
+        if p.get('name') and created:
+            try:
+                self._call_lsf('setnamed', created[0], 'name', p['name'])
+                created[0] = p['name']
+            except Exception as e:
+                warnings.append('rename failed: %s' % str(e)[:_ERR_MSG])
         try:
             count = int(count)
         except (TypeError, ValueError):
             count = len(created)
-        return {'status': 'ok', 'kind': 'gds', 'count': count,
-                'created': created[:50]}
+        result = {'status': 'ok' if not warnings else 'partial',
+                  'kind': 'gds', 'count': count, 'created': created[:50]}
+        if warnings:
+            result['warnings'] = warnings
+        return result
+
+    def _import_stl(self, p):
+        self._reject_import_options(
+            p, {'scale_factor', 'vertex_radius', 'debug'}, 'stl')
+        path = p['path']
+        args = [path]
+        scale = p.get('scale_factor')
+        vertex = p.get('vertex_radius')
+        debug = bool(p.get('debug', False))
+        if scale is not None or vertex is not None or debug:
+            args.append(1e-6 if scale is None else scale)
+        if vertex is not None or debug:
+            args.append(1e-12 if vertex is None else vertex)
+        if debug:
+            args.append(True)
+
+        try:
+            self._fsp.eval('groupscope("::model");')
+        except Exception:
+            pass
+        before = set(self._root_object_names())
+        try:
+            self._call_lsf('stlimport', *args)
+        except Exception as e:
+            raise BridgeError('stlimport failed: %s' % str(e)[:_ERR_MSG])
+        after = self._root_object_names()
+        created = [n for n in after if n not in before]
+
+        warnings = []
+        material = p.get('material')
+        for i, obj_name in enumerate(created):
+            if i == 0 and p.get('name'):
+                try:
+                    self._call_lsf('setnamed', obj_name, 'name', p['name'])
+                    obj_name = p['name']
+                    created[i] = obj_name
+                except Exception as e:
+                    warnings.append('rename failed: %s' % str(e)[:_ERR_MSG])
+            if material:
+                try:
+                    self._call_lsf('setnamed', obj_name, 'material', material)
+                except Exception as e:
+                    warnings.append('%s material: %s'
+                                    % (obj_name, str(e)[:_ERR_MSG]))
+        result = {'status': 'ok' if not warnings else 'partial',
+                  'kind': 'stl', 'count': len(created),
+                  'created': created[:50]}
+        if warnings:
+            result['warnings'] = warnings
+        return result
+
+    def _import_primitive(self, kind, p):
+        if kind == 'surface':
+            allowed = {'file_units', 'x0', 'y0', 'z0',
+                       'upper_surface', 'invert_xy'}
+        else:
+            allowed = {'file_units', 'x0', 'y0', 'z0',
+                       'reverse_index_order'}
+        self._reject_import_options(p, allowed, kind)
+        path = p['path']
+        units = str(p.get('file_units') or 'm')
+        x0 = float(p.get('x0') or 0.0)
+        y0 = float(p.get('y0') or 0.0)
+        z0 = float(p.get('z0') or 0.0)
+        upper = int(p.get('upper_surface', 1) or 0)
+        invert = int(p.get('invert_xy', 0) or 0)
+        reverse = int(p.get('reverse_index_order', 0) or 0)
+
+        try:
+            self._fsp.eval('groupscope("::model");')
+        except Exception:
+            pass
+        try:
+            self._call_lsf('addimport')
+        except Exception as e:
+            raise BridgeError('addimport failed: %s' % str(e)[:_ERR_MSG])
+        try:
+            imp = str(self._call_lsf('get', 'name'))
+        except Exception:
+            imp = 'import'
+        if p.get('name'):
+            try:
+                self._call_lsf('set', 'name', p['name'])
+                imp = p['name']
+            except Exception as e:
+                raise BridgeError('created import "%s" but renaming failed: %s'
+                                  % (imp, str(e)[:_ERR_MSG]))
+
+        try:
+            if kind == 'surface':
+                r = self._call_lsf('importsurface', path, upper, units,
+                                   x0, y0, z0, invert)
+            elif kind == 'binary':
+                r = self._call_lsf('importbinary', path, units,
+                                   x0, y0, z0, reverse)
+            else:
+                r = self._call_lsf('importnk', path, units,
+                                   x0, y0, z0, reverse)
+        except Exception as e:
+            self._delete_quietly(imp)
+            raise BridgeError('%s failed: %s' % (kind, str(e)[:_ERR_MSG]))
+        try:
+            failed = r is not None and float(r) == 0.0
+        except (TypeError, ValueError):
+            failed = False
+        if failed:
+            self._delete_quietly(imp)
+            raise BridgeError('%s reported failure (returned 0)' % kind)
+
+        warnings = []
+        material = p.get('material')
+        if material and kind != 'nk':
+            try:
+                self._call_lsf('setnamed', imp, 'material', material)
+            except Exception as e:
+                warnings.append('material: %s' % str(e)[:_ERR_MSG])
+        result = {'status': 'ok' if not warnings else 'partial',
+                  'kind': kind, 'name': imp, 'created': [imp]}
+        if warnings:
+            result['warnings'] = warnings
+        return result
+
+    def _import_step(self, p):
+        self._reject_import_options(p, {'scale_factor'}, 'step')
+        path = p['path']
+        args = [path]
+        scale = p.get('scale_factor')
+        if scale is not None:
+            args.append(scale)
+        try:
+            self._fsp.eval('groupscope("::model");')
+        except Exception:
+            pass
+        before = set(self._root_object_names())
+        try:
+            self._call_lsf('stepimport', *args)
+        except Exception as e:
+            msg = str(e)
+            if 'not a valid function' in msg:
+                raise BridgeError(
+                    'stepimport is not available on this engine (v202 lacks '
+                    'it); use the GUI or a newer Lumerical version.')
+            raise BridgeError('stepimport failed: %s' % msg[:_ERR_MSG])
+        after = self._root_object_names()
+        created = [n for n in after if n not in before]
+        warnings = []
+        for i, obj_name in enumerate(created):
+            if i == 0 and p.get('name'):
+                try:
+                    self._call_lsf('setnamed', obj_name, 'name', p['name'])
+                    created[i] = p['name']
+                except Exception as e:
+                    warnings.append('rename failed: %s' % str(e)[:_ERR_MSG])
+            if p.get('material'):
+                try:
+                    self._call_lsf('setnamed', obj_name, 'material',
+                                   p['material'])
+                except Exception as e:
+                    warnings.append('%s material: %s'
+                                    % (obj_name, str(e)[:_ERR_MSG]))
+        result = {'status': 'ok' if not warnings else 'partial',
+                  'kind': 'step', 'count': len(created),
+                  'created': created[:50]}
+        if warnings:
+            result['warnings'] = warnings
+        return result
 
     def _cmd_model_get(self, p):
         """Get full properties of ONE named object with type discriminator.

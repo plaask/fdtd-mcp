@@ -709,7 +709,9 @@ _LSF_BUILTINS = frozenset({
     # Material
     'setmaterial', 'getmaterial', 'addmaterial',
     'deletematerial', 'copymaterial', 'materialexists',
-    'importnk', 'importdataset', 'exportdataset', 'importmaterialdb',
+    'importnk', 'importnk2', 'importdataset', 'exportdataset', 'importmaterialdb',
+    'importsurface', 'importsurface2', 'importbinary', 'importbinary2',
+    'stlimport', 'addimport',
     'savematerial', 'getindex', 'getfdtdindex', 'geteps',
     # Object operations
     'delete', 'clear', 'copy', 'move', 'min', 'max', 'sqrt',

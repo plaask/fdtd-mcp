@@ -736,5 +736,102 @@
     ],
     "category": "analysis",
     "verified_against": "v202 - live engine probes 2026-11"
+  },
+  "addimport": {
+    "signature": "addimport()  or  addimport(struct)",
+    "returns": "none (creates an import primitive, auto-selected)",
+    "valid_args": {},
+    "common_pitfalls": [
+      "Verified live on v202 (2026-11): addimport creates an import primitive; importsurface/importbinary/importnk then populate it",
+      "The import primitive can represent a surface, binary volume, image-derived data or an n,k material"
+    ],
+    "category": "object",
+    "verified_against": "v202 - live engine probes 2026-11"
+  },
+  "stlimport": {
+    "signature": "stlimport(filename [, scalingFactor=1e-6 [, vertexRadius=1e-12 [, debugFlag=false]]])",
+    "returns": "none (adds a PlanarSolid structure)",
+    "valid_args": {
+      "filename": "path to the .stl file",
+      "scalingFactor": "STL has no units; default 1e-6 (microns)",
+      "vertexRadius": "minimum distance between distinct vertices (m)",
+      "debugFlag": "print vertex/triangle statistics"
+    },
+    "common_pitfalls": [
+      "Verified live on v202 (2026-11): stlimport created a PlanarSolid; set its material afterwards",
+      "A large triangle count can make debugFlag=true slow"
+    ],
+    "category": "import",
+    "verified_against": "v202 - live engine probes 2026-11"
+  },
+  "importsurface": {
+    "signature": "out = importsurface(filename [, upper_surface=1 [, file_units=\"m\" [, x0=0, y0=0, z0=0 [, invertXY=0]]]])",
+    "returns": "1 on success, 0 on failure",
+    "valid_args": {
+      "filename": "surface data file (x,y,z columns or Z matrix)",
+      "upper_surface": "1 upper, 0 lower",
+      "file_units": "\"m\", \"cm\", \"mm\", \"microns\", \"nm\"",
+      "x0/y0/z0": "data origin in global coordinates",
+      "invertXY": "reverse how x/y are read"
+    },
+    "common_pitfalls": [
+      "Verified live on v202 (2026-11): the command exists but requires a selected import primitive; without one it reports \"no import objects are currently selected\"",
+      "Call addimport first, then importsurface"
+    ],
+    "category": "import",
+    "verified_against": "v202 - live engine probes 2026-11"
+  },
+  "importbinary": {
+    "signature": "out = importbinary(filename [, file_units=\"m\" [, x0=0, y0=0, z0=0 [, reverse_index_order=0]]])",
+    "returns": "1 on success, 0 on failure",
+    "valid_args": {
+      "filename": "text file of 0/1 values (non-zero is treated as 1)",
+      "file_units": "\"m\", \"cm\", \"mm\", \"microns\", \"nm\""
+    },
+    "common_pitfalls": [
+      "Verified live on v202 (2026-11): requires a selected import primitive (addimport first)",
+      "At least 2 points are required in each dimension"
+    ],
+    "category": "import",
+    "verified_against": "v202 - live engine probes 2026-11"
+  },
+  "importnk": {
+    "signature": "out = importnk(filename [, file_units=\"m\" [, x0=0, y0=0, z0=0 [, reverse_index_order=0]]])",
+    "returns": "1 on success, 0 on failure",
+    "valid_args": {
+      "filename": "text file of n (and optional k) over a volume/surface",
+      "file_units": "\"m\", \"cm\", \"mm\", \"microns\", \"nm\""
+    },
+    "common_pitfalls": [
+      "Verified live on v202 (2026-11): requires a selected import primitive (addimport first)",
+      "The imported nk data is for a single frequency"
+    ],
+    "category": "import",
+    "verified_against": "v202 - live engine probes 2026-11"
+  },
+  "stepimport": {
+    "signature": "stepimport(\"filename\" [, scale_factor]); absent on v202 (newer engines only)",
+    "returns": "none (adds structures from a STEP/CAD file on newer engines)",
+    "valid_args": {
+      "filename": "STEP/CAD file",
+      "scale_factor": "3, 0, -3, -6 or -9"
+    },
+    "common_pitfalls": [
+      "Verified live on v202 (2026-11): stepimport is not a valid function on this build",
+      "Present on newer Lumerical versions; the MCP tool gates it and reports the v202 limitation"
+    ],
+    "category": "import",
+    "verified_against": "v202 - absent (live probe 2026-11)"
+  },
+  "importimage": {
+    "signature": "NOT AVAILABLE in v202 — 'importimage is not a valid function or variable name'. Use the GUI image-import wizard.",
+    "returns": "n/a",
+    "valid_args": {},
+    "common_pitfalls": [
+      "Verified live on v202 (2026-11): there is no importimage script command",
+      "The GUI image wizard creates an import primitive; scripting it is not supported on v202"
+    ],
+    "category": "import",
+    "verified_against": "v202 - dead (live probe 2026-11)"
   }
 }

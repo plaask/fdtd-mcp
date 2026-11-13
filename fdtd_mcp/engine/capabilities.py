@@ -26,6 +26,7 @@ DEAD_COMMANDS = frozenset([
     'findresult', 'hasresult', 'listresults',
     'adddftmonitor', 'addfield',
     'farfield', 'farfieldpolar',
+    'importimage',
 ])
 
 # Verified metadata source for the facts above (kept for the status tool).
@@ -78,6 +79,32 @@ OBJECT_TYPES = {
     # Port
     'port': {'add': 'addport', 'type': 'Port', 'group': 'Port', 'since': 'v202',
              'prereq': 'fdtd'},
+}
+
+
+# Import kinds for import_add. "needs_import_object" means addimport first,
+# then the import* command populates the selected import primitive.
+# Verified live on v202 2026-11: gdsimport, stlimport, importsurface,
+# importbinary and importnk exist; stepimport and importimage do not.
+IMPORT_KINDS = {
+    'gds': {'command': 'gdsimport', 'needs_import_object': False,
+            'since': 'v202', 'verified': True},
+    'stl': {'command': 'stlimport', 'needs_import_object': False,
+            'since': 'v202', 'verified': True,
+            'notes': 'adds structures directly (PlanarSolid)'},
+    'surface': {'command': 'importsurface', 'needs_import_object': True,
+                'since': 'v202', 'verified': True},
+    'binary': {'command': 'importbinary', 'needs_import_object': True,
+               'since': 'v202', 'verified': True},
+    'nk': {'command': 'importnk', 'needs_import_object': True,
+           'since': 'v202', 'verified': True},
+    'step': {'command': 'stepimport', 'needs_import_object': False,
+             'since': 'newer', 'verified': False,
+             'notes': 'v202 has no stepimport; available on newer engines'},
+    'image': {'command': None, 'needs_import_object': False,
+              'since': 'unknown', 'verified': False,
+              'notes': 'v202 has no importimage script command; use the GUI '
+                       'image-import wizard'},
 }
 
 

@@ -172,6 +172,33 @@ def main():
     check('stack_report finds layers',
           r.get('layer_count', 0) >= 1 and bool(r.get('fdtd')), r)
 
+    # --- import_add: STL is real on v202; STEP is gated ---------------------
+    import tempfile
+    stl = os.path.join(tempfile.gettempdir(), 'fdtd_mcp_live_probe.stl')
+    with open(stl, 'w') as fh:
+        fh.write('solid tet\n')
+        for normal, tri in [
+                ((0, 0, -1), ((0, 0, 0), (0, 1, 0), (1, 0, 0))),
+                ((0, -1, 0), ((0, 0, 0), (1, 0, 0), (0, 0, 1))),
+                ((-1, 0, 0), ((0, 0, 0), (0, 0, 1), (0, 1, 0))),
+                ((1, 1, 1), ((1, 0, 0), (0, 1, 0), (0, 0, 1)))]:
+            fh.write(' facet normal %d %d %d\n  outer loop\n' % normal)
+            for v in tri:
+                fh.write('   vertex %d %d %d\n' % v)
+            fh.write('  endloop\n endfacet\n')
+        fh.write('endsolid tet\n')
+    try:
+        r = call(b, 'import_add', kind='stl', path=stl, name='live_stl')
+        check('import_add stl', r.get('status') == 'ok' and
+              'live_stl' in (r.get('created') or []), r)
+    finally:
+        try:
+            os.remove(stl)
+        except OSError:
+            pass
+    r = call(b, 'import_add', kind='step', path='missing.step')
+    check('stepimport gated on v202', '_error' in r, r)
+
     # --- complex sampled material + anisotropic index ----------------------
     r = call(b, 'material_add', type='Sampled 3D data')
     mname = r.get('name')

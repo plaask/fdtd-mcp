@@ -162,7 +162,9 @@ New in this pass (verified against v202):
   not n/k).
 * `stack_report` sorts layers by z and flags overlaps, gaps, sub-nm layers,
   layers outside the FDTD z range, and structures filling the transverse PML.
-* `import_add` supports GDSII first (`gdsimport`); STL/surface/image follow.
+* `import_add` supports GDSII (`gdsimport`), STL (`stlimport`) and
+  surface/binary/nk (`addimport` + `importsurface`/`importbinary`/`importnk`);
+  STEP needs a newer engine, and image import is GUI-only on v202.
 * `sweep_set` checks the `setsweep` 0/1 return value; unknown properties such as
   `solver` now return `status: error` instead of a silent success.
 

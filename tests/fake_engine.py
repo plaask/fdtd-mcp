@@ -606,6 +606,38 @@ class FakeFDTD(object):
             self._create_object(func_name)
             return None
 
+        if func_name == 'addimport':
+            name = self._next_name('import')
+            obj = _Obj('Import')
+            obj.scope = self._scope
+            obj.props['name'] = name
+            obj.props['enabled'] = True
+            self._apply_defaults(obj)
+            self._objects[name] = obj
+            self._selected = name
+            return None
+
+        if func_name == 'stlimport':
+            name = self._next_name('stl')
+            obj = _Obj('PlanarSolid')
+            obj.scope = self._scope
+            obj.props['name'] = name
+            obj.props['enabled'] = True
+            self._apply_defaults(obj)
+            self._objects[name] = obj
+            self._selected = name
+            return None
+
+        if func_name in ('importsurface', 'importbinary', 'importnk'):
+            obj = self._selected_object()
+            if obj.type != 'Import':
+                raise RuntimeError('no import objects are currently selected')
+            obj.props['import type'] = func_name
+            return 1.0
+
+        if func_name in ('stepimport', 'importimage'):
+            raise RuntimeError(func_name + ' is not a valid function or variable name')
+
         if func_name == 'gdsimport':
             if len(args) < 3:
                 raise RuntimeError('argument list for gdsimport command is incorrect')

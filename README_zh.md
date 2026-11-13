@@ -178,7 +178,7 @@ sweep_add(..., parameters=[{"name": "gap", "parameter": "::model::gap",
 * `model_add` 新增 `port`、`mode_expansion`、`container_group`、`custom`、`planar_solid`、`stack`、`layer_builder`；`port` 需要先有 FDTD 区域。
 * `material_index` 按 xx/yy/zz 采样各向异性材料；`material_set` 的 `sampled 3d data` 4 列是 `[f, eps_xx, eps_yy, eps_zz]`（频率 Hz + 复介电常数，不是 n/k）。
 * `stack_report` 按 z 排序并标出重叠、间隙、薄层、超出 FDTD z 范围、填满横向 PML 的结构。
-* `import_add` 先用 GDSII（`gdsimport`）；STL/表面/Image 后续。
+* `import_add` 支持 GDSII（`gdsimport`）、STL（`stlimport`）和 surface/binary/nk（`addimport` + `importsurface`/`importbinary`/`importnk`）；STEP 需要更新版本，Image 在 v202 只能走 GUI。
 * `sweep_set` 会检查 `setsweep` 的 0/1 返回值；未知属性（如 `solver`）报 `status: error`，不再静默成功。
 
 ### 对象库（结构组 / 分析组）

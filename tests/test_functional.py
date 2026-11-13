@@ -218,7 +218,7 @@ def test_attribute_add(bs):
     assert 'error' in r and 'Unknown grid attribute' in r['error']['message']
 
 
-def test_import_add_gds(bs):
+def test_import_add_kinds(bs):
     bs.fresh()
     r = bs.send('import_add', {'path': 'chip.gds', 'cell': 'TOP', 'layer': 1})
     assert r['result']['status'] == 'ok'
@@ -229,9 +229,29 @@ def test_import_add_gds(bs):
                                'zmin': -1e-7, 'zmax': 0})
     assert 'error' in r and 'material' in r['error']['message']
 
-    r = bs.send('import_add', {'path': 'chip.gds', 'cell': 'TOP', 'layer': 1,
-                               'kind': 'stl'})
-    assert 'error' in r and 'gds' in r['error']['message']
+    # STL adds structure(s) directly.
+    r = bs.send('import_add', {'kind': 'stl', 'path': 'part.stl'})
+    assert r['result']['status'] == 'ok'
+    assert r['result']['created']
+
+    # surface/binary/nk create an import primitive and fill it.
+    for kind in ('surface', 'binary', 'nk'):
+        r = bs.send('import_add', {'kind': kind, 'path': kind + '.dat',
+                                   'file_units': 'microns'})
+        assert r['result']['status'] == 'ok', r
+        assert r['result']['name']
+        q = bs.send('model_get', {'name': r['result']['name']})
+        assert q['result']['type'] == 'Import'
+
+    r = bs.send('import_add', {'kind': 'surface', 'path': 'x.txt',
+                               'cell': 'TOP'})
+    assert 'error' in r and 'cell' in r['error']['message']
+
+    r = bs.send('import_add', {'kind': 'step', 'path': 'part.step'})
+    assert 'error' in r and 'stepimport' in r['error']['message']
+
+    r = bs.send('import_add', {'kind': 'image', 'path': 'pic.png'})
+    assert 'error' in r and 'importimage' in r['error']['message']
 
 
 def test_model_get_include_all_properties(bs):

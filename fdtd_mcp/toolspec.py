@@ -15,11 +15,12 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 
-from .engine.capabilities import OBJECT_TYPES
+from .engine.capabilities import IMPORT_KINDS, OBJECT_TYPES
 
-# The model_add enum is generated from the same registry the bridge dispatches
-# from, so adding an object type is one edit (engine/capabilities.py).
+# The enums are generated from the same registries the bridge dispatches from,
+# so adding an object/import type is one edit (engine/capabilities.py).
 _MODEL_ADD_TYPES = sorted(OBJECT_TYPES)
+_IMPORT_KINDS = sorted(IMPORT_KINDS)
 
 
 @dataclass(frozen=True)
@@ -169,30 +170,62 @@ SPECS = [
         name='import_add',
         module='model',
         description=(
-'Import structures from a GDSII file (v202 gdsimport).\n'
+'Import geometry/data from a file.\n'
         '\n'
-        'Signature used: gdsimport(path, cell, layer [, material [, zmin, zmax]]).\n'
-        'Without zmin/zmax the 2D data is extruded to the default Z in a 3D\n'
-        'layout; with both, the structures are extruded to that exact z range\n'
-        '(material is required for that form).\n'
+        'Kinds (v202-verified unless noted):\n'
+        '  gds      gdsimport(path, cell, layer [, material [, zmin, zmax]])\n'
+        '           cell and layer are required; zmin/zmax need material\n'
+        '  stl      stlimport(path [, scale_factor=1e-6 [, vertex_radius=1e-12\n'
+        '           [, debug=false]]]); adds PlanarSolid structure(s)\n'
+        '  surface  addimport + importsurface(path, upper_surface=1,\n'
+        '           file_units="m", x0,y0,z0, invert_xy=0)\n'
+        '  binary   addimport + importbinary(path, file_units="m", x0,y0,z0,\n'
+        '           reverse_index_order=0)\n'
+        '  nk       addimport + importnk(path, file_units="m", x0,y0,z0,\n'
+        '           reverse_index_order=0)\n'
+        '  step     stepimport(path [, scale_factor]); NOT available on v202\n'
+        '           (the command does not exist there)\n'
+        '  image    no v202 script command; use the GUI image-import wizard\n'
         '\n'
-        'Returns the number of imported objects and their root-level names.\n'
-        'Run this in layout mode; an analysis-mode project must switch back first.\n'
+        'Returns the created object names (gds/stl) or the import-primitive name\n'
+        '(surface/binary/nk). Run in layout mode; an analysis-mode project must\n'
+        'switch back first.\n'
         '\n'
-        'Example:\n'
+        'Examples:\n'
+        '  import_add(kind="stl", path="D:/data/part.stl", scale_factor=1e-6)\n'
+        '  import_add(kind="surface", path="D:/data/topography.txt",\n'
+        '             file_units="microns", z0=2e-6)\n'
         '  import_add(kind="gds", path="D:/data/chip.gds", cell="TOP", layer=1,\n'
         '             material="Si (Silicon) - Palik", zmin=-220e-9, zmax=0)'
         ),
         schema={'type':'object','properties':{
-        'kind':{'type':'string','enum':['gds'],
-            'description':'Import kind (only gds is supported so far)'},
-        'path':{'type':'string','description':'Path to the .gds file'},
-        'cell':{'type':'string','description':'GDS cell name'},
-        'layer':{'type':'integer','description':'GDS layer number'},
+        'kind':{'type':'string','enum': _IMPORT_KINDS,
+            'description':'Import kind (default gds)'},
+        'path':{'type':'string','description':'Path to the file to import'},
+        'name':{'type':'string',
+            'description':'Optional object name (import primitive / STL structure)'},
+        'cell':{'type':'string','description':'GDS cell name (gds only)'},
+        'layer':{'type':'integer','description':'GDS layer number (gds only)'},
         'material':{'type':'string','description':'Optional material name'},
-        'zmin':{'type':'number','description':'Optional extrusion z min (m)'},
-        'zmax':{'type':'number','description':'Optional extrusion z max (m)'}},
-        'required':['path','cell','layer']},
+        'zmin':{'type':'number','description':'GDS extrusion z min (m)'},
+        'zmax':{'type':'number','description':'GDS extrusion z max (m)'},
+        'scale_factor':{'type':'number',
+            'description':'STL scaling factor (default 1e-6) or STEP 3/0/-3/-6/-9'},
+        'vertex_radius':{'type':'number',
+            'description':'STL vertex merge radius in metres (default 1e-12)'},
+        'debug':{'type':'boolean','description':'STL debug output (default false)'},
+        'file_units':{'type':'string',
+            'description':'surface/binary/nk file units: m, cm, mm, microns, nm'},
+        'x0':{'type':'number','description':'Data origin x (m)'},
+        'y0':{'type':'number','description':'Data origin y (m)'},
+        'z0':{'type':'number','description':'Data origin z (m)'},
+        'upper_surface':{'type':'integer',
+            'description':'surface: 1=upper (default), 0=lower'},
+        'invert_xy':{'type':'integer',
+            'description':'surface: reverse x/y reading (default 0)'},
+        'reverse_index_order':{'type':'integer',
+            'description':'binary/nk: reverse index order (default 0)'}},
+        'required':['path']},
         defaults={'kind': 'gds'},
         destructive=True,
     ),
